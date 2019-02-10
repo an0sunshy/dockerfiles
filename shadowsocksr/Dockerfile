@@ -2,7 +2,7 @@
 #
 # docker run -p port:port -v your_config_file:/client.json \
 #       -d --name ssr \
-#       an0sunshy/ssr
+#       an0sunshy/shadowsocksr
 
 FROM alpine:latest
 
