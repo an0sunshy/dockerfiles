@@ -1,3 +1,9 @@
+# Run shadowsocksr-python with a config file
+#
+# docker run -p port:port -v your_config_file:/client.json \
+#       -d --name ssr \
+#       an0sunshy/ssr
+
 FROM alpine:latest
 
 ENV VER=3.2.2
