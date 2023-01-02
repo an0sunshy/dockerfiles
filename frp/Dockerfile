@@ -8,7 +8,7 @@ FROM alpine:latest
 
 LABEL maintainer="an0sunshy <an0sunshy@gmail.com>"
 
-ENV FRP_VERSION 0.45.0
+ENV FRP_VERSION 0.46.0
 ENV FRP_DOWNLOAD_URL https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz
 
 VOLUME /config
