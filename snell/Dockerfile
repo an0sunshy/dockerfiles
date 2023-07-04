@@ -1,5 +1,8 @@
 FROM alpine:latest as builder
 
+LABEL maintainer="an0sunshy <an0sunshy@gmail.com>"
+LABEL org.opencontainers.image.source=https://github.com/an0sunshy/dockerfiles
+
 ENV SNELL_VERSION 'v4.0.1'
 
 WORKDIR /tmp

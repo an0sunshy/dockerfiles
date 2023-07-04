@@ -21,7 +21,7 @@ jobs:
 
       - name: Build and push Docker images
         run: |
-          for DIR in frp; do
+          for DIR in frp snell; do
             echo "Building Docker image for $DIR"
             docker build -t ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest $DIR
             echo "Pushing Docker image for $DIR"
