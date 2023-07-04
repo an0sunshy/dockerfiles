@@ -7,6 +7,8 @@
 FROM alpine:latest
 
 LABEL maintainer="an0sunshy <an0sunshy@gmail.com>"
+LABEL org.opencontainers.image.source=https://github.com/an0sunshy/dockerfiles
+
 
 ENV FRP_VERSION 0.49.0
 ENV FRP_DOWNLOAD_URL https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz
