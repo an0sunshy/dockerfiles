@@ -1,0 +1,30 @@
+name: Build and Push Docker Images
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build and push Docker images
+        run: |
+          for DIR in frp; do
+            echo "Building Docker image for $DIR"
+            docker build -t ghcr.io/${{ github.repository_owner }}/$DIR:latest $DIR
+            echo "Pushing Docker image for $DIR"
+            docker push ghcr.io/${{ github.repository_owner }}/$DIR:latest
+            echo "$DIR=ghcr.io/${{ github.repository_owner }}/$DIR:latest" >> $GITHUB_ENV
+          done
