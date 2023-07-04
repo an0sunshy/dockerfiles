@@ -23,8 +23,8 @@ jobs:
         run: |
           for DIR in frp; do
             echo "Building Docker image for $DIR"
-            docker build -t ghcr.io/${{ github.repository_owner }}/$DIR:latest $DIR
+            docker build -t ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest $DIR
             echo "Pushing Docker image for $DIR"
-            docker push ghcr.io/${{ github.repository_owner }}/$DIR:latest
-            echo "$DIR=ghcr.io/${{ github.repository_owner }}/$DIR:latest" >> $GITHUB_ENV
+            docker push ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest
+            echo "$DIR=ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest" >> $GITHUB_ENV
           done
