@@ -19,7 +19,7 @@ ADD ${FRP_DOWNLOAD_URL} /tmp/
 
 RUN  tar -zxf /tmp/frp_${FRP_VERSION}_linux_amd64.tar.gz --strip 1 \
     && rm /tmp/frp_${FRP_VERSION}_linux_amd64.tar.gz \
-    && rm *.ini
+    && rm *.toml
 
 ADD  entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
