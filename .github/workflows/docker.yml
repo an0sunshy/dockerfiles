@@ -9,17 +9,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v2
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v1
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Build and push Docker images
+      # frp and snell hardcode amd64 release downloads, so they stay amd64-only.
+      - name: Build and push Docker images (amd64)
         run: |
           for DIR in frp snell; do
             echo "Building Docker image for $DIR"
@@ -28,3 +32,13 @@ jobs:
             docker push ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest
             echo "$DIR=ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest" >> $GITHUB_ENV
           done
+
+      # Pure-Python (stdlib-only) reporter — multi-arch so Linux x86 hosts and
+      # Apple Silicon Macs pull the same tag natively.
+      - name: Build and push claude-usage-exporter (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./claude-usage-exporter
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/dockerfiles/claude-usage-exporter:latest
