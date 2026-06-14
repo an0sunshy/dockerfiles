@@ -136,7 +136,7 @@ def parse(projects_dir):
     return tokens, cost, messages, sessions, unpriced, len(files)
 
 
-def render(tokens, cost, messages, sessions, n_files, duration, host):
+def render(tokens, cost, messages, sessions, unpriced, n_files, duration, host):
     """Render Prometheus text-exposition format.
 
     On hosts running alloy-remote, `host` is added by remote_write external_labels,
@@ -174,9 +174,17 @@ def render(tokens, cost, messages, sessions, n_files, duration, host):
            (((lp("model", model), lp("entrypoint", entry)), m)
             for (model, entry), m in sorted(messages.items())))
 
+    # Info series (value 1) naming each model seen in transcripts but missing from
+    # PRICING — its usage is counted at $0. Normally emits no series; when one
+    # appears, alerting fires on the scalar gauge below and reads the model name here.
+    family("claude_code_unpriced_model_info",
+           "Models seen in transcripts but absent from the PRICING table (value 1; usage counted at $0 until added).", "gauge",
+           (((lp("model", model),), 1) for model in sorted(unpriced)))
+
     ts = int(time.time())
     for name, helptext, mtype, value in (
         ("claude_code_sessions_total", "Distinct Claude Code session count.", "counter", len(sessions)),
+        ("claude_code_usage_exporter_unpriced_models", "Count of distinct models seen but absent from the PRICING table (usage counted at $0).", "gauge", len(unpriced)),
         ("claude_code_usage_exporter_transcripts", "Transcript files parsed in the last run.", "gauge", n_files),
         ("claude_code_usage_exporter_last_run_timestamp_seconds", "Unix time of the last exporter run.", "gauge", ts),
         ("claude_code_usage_exporter_duration_seconds", "Wall-clock seconds of the last exporter run.", "gauge", round(duration, 3)),
@@ -225,7 +233,7 @@ def serve(args):
         if unpriced:
             print(f"warning: model(s) absent from pricing table, counted at $0: "
                   f"{', '.join(sorted(unpriced))}", file=sys.stderr)
-        state["text"] = render(tokens, cost, messages, sessions, n_files,
+        state["text"] = render(tokens, cost, messages, sessions, unpriced, n_files,
                                time.time() - start, args.host)
         state["ts"] = time.monotonic()
 
@@ -295,7 +303,7 @@ def main():
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    text = render(tokens, cost, messages, sessions, n_files, duration, args.host)
+    text = render(tokens, cost, messages, sessions, unpriced, n_files, duration, args.host)
     tmp = f"{args.output}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         f.write(text)
