@@ -1,6 +1,8 @@
 FROM alpine:latest as builder
 
-ENV SNELL_VERSION 'v4.0.1'
+# v6.0.0-beta-2 (download token is "v6.0.0b2"); see
+# https://kb.nssurge.com/surge-knowledge-base/release-notes/snell
+ENV SNELL_VERSION 'v6.0.0b2'
 
 WORKDIR /tmp
 

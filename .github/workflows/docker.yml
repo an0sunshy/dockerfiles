@@ -39,6 +39,18 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/dockerfiles/claude-usage-exporter:latest
 
+      # Health gate: pull the just-pushed image and confirm it actually runs and
+      # parses (empty input -> "parsed 0 transcripts", exit 0). Catches a broken
+      # publish before any host pulls it.
+      - name: Smoke-test the reporter image
+        run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/dockerfiles/claude-usage-exporter:latest
+          docker pull "$IMG"
+          mkdir -p /tmp/empty-projects
+          out=$(docker run --rm -v /tmp/empty-projects:/projects:ro "$IMG" --print --projects-dir=/projects)
+          echo "$out"
+          echo "$out" | grep -q "parsed 0 transcripts" || { echo "::error::reporter image smoke test failed"; exit 1; }
+
       # frp and snell hardcode amd64 release downloads, so they stay amd64-only.
       # continue-on-error: these legacy packages predate GITHUB_TOKEN and may
       # need a one-time package->repo link in ghcr settings; don't let them block
