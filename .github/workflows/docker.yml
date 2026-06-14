@@ -2,12 +2,18 @@ name: Build and Push Docker Images
 
 on: [push]
 
+# Use the built-in GITHUB_TOKEN (auto-provisioned per run) instead of a
+# long-lived PAT — least privilege, nothing to rotate or leak.
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -20,21 +26,11 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
-
-      # frp and snell hardcode amd64 release downloads, so they stay amd64-only.
-      - name: Build and push Docker images (amd64)
-        run: |
-          for DIR in frp snell; do
-            echo "Building Docker image for $DIR"
-            docker build -t ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest $DIR
-            echo "Pushing Docker image for $DIR"
-            docker push ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest
-            echo "$DIR=ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest" >> $GITHUB_ENV
-          done
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Pure-Python (stdlib-only) reporter — multi-arch so Linux x86 hosts and
-      # Apple Silicon Macs pull the same tag natively.
+      # Apple Silicon Macs pull the same tag natively. Built first so it is not
+      # gated behind the legacy amd64 images below.
       - name: Build and push claude-usage-exporter (multi-arch)
         uses: docker/build-push-action@v6
         with:
@@ -42,3 +38,17 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/dockerfiles/claude-usage-exporter:latest
+
+      # frp and snell hardcode amd64 release downloads, so they stay amd64-only.
+      # continue-on-error: these legacy packages predate GITHUB_TOKEN and may
+      # need a one-time package->repo link in ghcr settings; don't let them block
+      # the run or the reporter image above.
+      - name: Build and push Docker images (amd64)
+        continue-on-error: true
+        run: |
+          for DIR in frp snell; do
+            echo "Building Docker image for $DIR"
+            docker build -t ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest $DIR
+            echo "Pushing Docker image for $DIR"
+            docker push ghcr.io/${{ github.repository_owner }}/dockerfiles/$DIR:latest
+          done
