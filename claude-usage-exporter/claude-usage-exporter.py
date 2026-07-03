@@ -15,12 +15,24 @@ on a Max/Pro plan it answers "what would this have cost on the API" for the
 upgrade/value question. Cache writes are priced by actual TTL (5m vs 1h) from the
 `ephemeral_*_input_tokens` split; cache reads at 0.1x input.
 
-Scaling note: this re-parses every transcript each run (global dedup requires it).
-~257MB parses in ~1.5s today; if the transcript store grows past a few GB, switch
-to an incremental file-mtime cache with a persisted global seen-set.
+Durable monotonic counter: the emitted metrics are Prometheus `counter`s, so they
+must never decrease. The transcript store on disk SHRINKS (sessions cleared with
+`/clear`, pruned, rotated), so recomputing an absolute total from disk each run
+drops when a transcript disappears — Prometheus reads that as a counter reset and
+inflates increase()/rate(). Instead we accumulate incrementally: a persisted
+`--state-file` holds per-series running totals plus the set of already-counted
+message identities, so a deleted transcript never subtracts and a re-parse never
+double-counts. Without --state-file the accumulator is in-memory only (monotonic
+within a process, re-baselines on restart).
+
+Scaling note: the persisted seen-set grows with total messages ever counted (one
+8-byte hash each). ~257MB of transcripts parses in ~1.5s today; if the seen-set
+grows past a few million entries, switch to a per-file (path, byte-offset) cursor
+so appended lines are read without rehashing the whole store.
 """
 import argparse
 import glob
+import hashlib
 import http.server
 import json
 import os
@@ -50,6 +62,13 @@ CACHE_WRITE_1H_MULT = 2.0
 # Token buckets tracked per (model, entrypoint).
 TYPES = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
 
+# Bump when the on-disk state schema changes incompatibly.
+STATE_VERSION = 1
+
+# Separator joining (model, entrypoint) into a single JSON-safe series key. The
+# ASCII unit separator never appears in a model id or entrypoint string.
+_SEP = "\x1f"
+
 
 def normalize_model(model):
     """Strip a dated snapshot suffix (e.g. claude-haiku-4-5-20251001)."""
@@ -61,19 +80,118 @@ def normalize_model(model):
     return model
 
 
-def parse(projects_dir):
-    tokens = defaultdict(lambda: defaultdict(int))   # (model, entrypoint) -> type -> tokens
-    cost = defaultdict(float)                          # (model, entrypoint) -> usd
-    messages = defaultdict(int)                        # (model, entrypoint) -> count
-    sessions = set()
-    seen = set()
-    unpriced = set()  # models seen in transcripts but absent from PRICING (counted at $0)
+def _ident_hash(s):
+    """Stable, compact identity for the seen-set (8-byte blake2b, 16 hex chars)."""
+    return hashlib.blake2b(s.encode("utf-8", "surrogatepass"),
+                           digest_size=8).hexdigest()
+
+
+def _skey(model, entry):
+    return f"{model}{_SEP}{entry}"
+
+
+def empty_state():
+    """A fresh, zeroed accumulator.
+
+    tokens:   series-key -> {type: int}
+    cost:     series-key -> usd float
+    messages: series-key -> int
+    seen:     set of counted message-identity hashes (dedup across runs/restarts)
+    sessions: set of session-id hashes (distinct-session count)
+    """
+    return {
+        "version": STATE_VERSION,
+        "tokens": {},
+        "cost": {},
+        "messages": {},
+        "seen": set(),
+        "sessions": set(),
+    }
+
+
+def load_state(path):
+    """Load persisted accumulator, or return an empty one if absent/corrupt.
+
+    Corrupt/unreadable state degrades to empty (with a warning) rather than
+    crash-looping; the next parse re-accumulates from whatever is on disk, which
+    re-baselines the counter once — better than never serving metrics.
+    """
+    if not path or not os.path.exists(path):
+        return empty_state()
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        st = empty_state()
+        st["tokens"] = {k: {t: int(v.get(t, 0)) for t in TYPES}
+                        for k, v in data["tokens"].items()}
+        st["cost"] = {k: float(v) for k, v in data["cost"].items()}
+        st["messages"] = {k: int(v) for k, v in data["messages"].items()}
+        st["seen"] = set(data.get("seen", []))
+        st["sessions"] = set(data.get("sessions", []))
+        return st
+    except (ValueError, OSError, TypeError, KeyError, AttributeError) as e:
+        print(f"warning: could not load state file {path} ({e}); starting fresh",
+              file=sys.stderr)
+        return empty_state()
+
+
+def save_state(path, state):
+    """Atomically persist the accumulator (tmp + os.replace, like the .prom write)."""
+    data = {
+        "version": STATE_VERSION,
+        "tokens": state["tokens"],
+        "cost": state["cost"],
+        "messages": state["messages"],
+        # list(), not sorted() — order is irrelevant on reload (rebuilt into a
+        # set) and saves the O(n log n) sort under the serve lock as it grows.
+        "seen": list(state["seen"]),
+        "sessions": list(state["sessions"]),
+    }
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def persist_state(path, state):
+    """Save state, but never let a persistence failure take metrics down.
+
+    Symmetric with load_state's graceful degradation: if /state is unwritable
+    (full disk, read-only remount), warn and keep serving from the in-memory
+    accumulator rather than propagating OSError out of the scrape path.
+    """
+    try:
+        save_state(path, state)
+    except OSError as e:
+        print(f"warning: could not persist state to {path} ({e}); "
+              f"continuing from memory", file=sys.stderr)
+
+
+def update_state(state, projects_dir):
+    """Fold any not-yet-counted transcript messages into `state` (mutates it).
+
+    Only NEW message identities are added — deletions never subtract, re-parses
+    never double-count — so the accumulated totals are monotonic. Returns the set
+    of unpriced models seen on disk this run (a gauge; not banked), the file
+    count, and whether the accumulator changed (so callers skip a no-op save).
+    """
+    tokens = state["tokens"]
+    cost = state["cost"]
+    messages = state["messages"]
+    seen = state["seen"]
+    sessions = state["sessions"]
+    baseline = len(seen) + len(sessions)  # to report whether anything new was folded in
+    unpriced = set()  # models on disk absent from PRICING — deferred, not counted
     files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
 
     for fp in files:
         try:
+            rel = os.path.relpath(fp, projects_dir)
             with open(fp, "r") as f:
-                for line in f:
+                for line_no, line in enumerate(f):
                     if '"usage"' not in line:
                         continue
                     try:
@@ -86,20 +204,33 @@ def parse(projects_dir):
                     u = msg.get("usage") or {}
                     if not u:
                         continue
-                    key = (msg.get("id"), o.get("requestId"))
-                    if key != (None, None):  # only dedup messages that actually carry an id
-                        if key in seen:
-                            continue
-                        seen.add(key)
+
+                    mid, rid = msg.get("id"), o.get("requestId")
+                    if mid is None and rid is None:
+                        # Keyless record: identity from position in its append-only
+                        # file, so repeated scrapes dedup it too.
+                        ident = f"{rel}#{line_no}"
+                    else:
+                        ident = f"{mid}{_SEP}{rid}"
+                    h = _ident_hash(ident)
+                    if h in seen:
+                        continue
 
                     model = normalize_model(msg.get("model"))
                     if model.startswith("<"):  # e.g. "<synthetic>" — no real usage
                         continue
+                    sid = o.get("sessionId")
+                    if sid:
+                        sessions.add(_ident_hash(sid))
                     if model not in PRICING:
+                        # Defer: don't bank at $0 (which would freeze this cost
+                        # forever) and don't mark seen — once PRICING gains the
+                        # model, a later run counts it while it's still on disk.
                         unpriced.add(model)
+                        continue
+
+                    seen.add(h)
                     entry = o.get("entrypoint") or "unknown"
-                    if o.get("sessionId"):
-                        sessions.add(o["sessionId"])
 
                     inp = u.get("input_tokens", 0) or 0
                     out = u.get("output_tokens", 0) or 0
@@ -115,16 +246,17 @@ def parse(projects_dir):
                         c1h = c1h or 0
                         c5m = c5m or 0
 
-                    k = (model, entry)
-                    tokens[k]["input"] += inp
-                    tokens[k]["output"] += out
-                    tokens[k]["cache_read"] += cread
-                    tokens[k]["cache_write_5m"] += c5m
-                    tokens[k]["cache_write_1h"] += c1h
-                    messages[k] += 1
+                    k = _skey(model, entry)
+                    td = tokens.setdefault(k, {t: 0 for t in TYPES})
+                    td["input"] += inp
+                    td["output"] += out
+                    td["cache_read"] += cread
+                    td["cache_write_5m"] += c5m
+                    td["cache_write_1h"] += c1h
+                    messages[k] = messages.get(k, 0) + 1
 
-                    p_in, p_out = PRICING.get(model, (0.0, 0.0))
-                    cost[k] += (
+                    p_in, p_out = PRICING[model]
+                    cost[k] = cost.get(k, 0.0) + (
                         inp * p_in
                         + cread * p_in * CACHE_READ_MULT
                         + c5m * p_in * CACHE_WRITE_5M_MULT
@@ -134,11 +266,12 @@ def parse(projects_dir):
         except OSError:
             continue
 
-    return tokens, cost, messages, sessions, unpriced, len(files)
+    dirty = (len(seen) + len(sessions)) != baseline  # only-add, so != means grew
+    return unpriced, len(files), dirty
 
 
-def render(tokens, cost, messages, sessions, unpriced, n_files, duration, host):
-    """Render Prometheus text-exposition format.
+def render(state, unpriced, n_files, duration, host):
+    """Render Prometheus text-exposition format from the accumulated state.
 
     On hosts running alloy-remote, `host` is added by remote_write external_labels,
     so leave --host empty there. Set --host only where nothing else labels the series.
@@ -162,30 +295,45 @@ def render(tokens, cost, messages, sessions, unpriced, n_files, duration, host):
         for label_pairs, value in rows:
             out.append(f"{name}{labels(*label_pairs)} {value}")
 
-    family("claude_code_tokens_total",
-           "Cumulative Claude Code token usage (parsed from local transcripts).", "counter",
-           (((lp("model", model), lp("type", t), lp("entrypoint", entry)), d[t])
-            for (model, entry), d in sorted(tokens.items()) for t in TYPES))
-    family("claude_code_cost_usd_total",
-           "Cumulative API-equivalent cost in USD (list price; not a subscription bill).", "counter",
-           (((lp("model", model), lp("entrypoint", entry)), f"{c:.6f}")
-            for (model, entry), c in sorted(cost.items())))
-    family("claude_code_messages_total",
-           "Cumulative assistant message count.", "counter",
-           (((lp("model", model), lp("entrypoint", entry)), m)
-            for (model, entry), m in sorted(messages.items())))
+    tokens, cost, messages = state["tokens"], state["cost"], state["messages"]
 
-    # Info series (value 1) naming each model seen in transcripts but missing from
-    # PRICING — its usage is counted at $0. Normally emits no series; when one
-    # appears, alerting fires on the scalar gauge below and reads the model name here.
+    tok_rows = []
+    for k, d in sorted(tokens.items()):
+        model, entry = k.split(_SEP, 1)
+        for t in TYPES:
+            tok_rows.append(((lp("model", model), lp("type", t),
+                              lp("entrypoint", entry)), d.get(t, 0)))
+    family("claude_code_tokens_total",
+           "Cumulative Claude Code token usage (parsed from local transcripts).",
+           "counter", tok_rows)
+
+    cost_rows = []
+    for k, c in sorted(cost.items()):
+        model, entry = k.split(_SEP, 1)
+        cost_rows.append(((lp("model", model), lp("entrypoint", entry)), f"{c:.6f}"))
+    family("claude_code_cost_usd_total",
+           "Cumulative API-equivalent cost in USD (list price; not a subscription bill).",
+           "counter", cost_rows)
+
+    msg_rows = []
+    for k, m in sorted(messages.items()):
+        model, entry = k.split(_SEP, 1)
+        msg_rows.append(((lp("model", model), lp("entrypoint", entry)), m))
+    family("claude_code_messages_total",
+           "Cumulative assistant message count.", "counter", msg_rows)
+
+    # Info series (value 1) naming each model seen on disk but missing from
+    # PRICING — its usage is deferred (uncounted) until priced. Normally emits no
+    # series; when one appears, alerting fires on the scalar gauge below and reads
+    # the model name here.
     family("claude_code_unpriced_model_info",
-           "Models seen in transcripts but absent from the PRICING table (value 1; usage counted at $0 until added).", "gauge",
-           (((lp("model", model),), 1) for model in sorted(unpriced)))
+           "Models seen in transcripts but absent from the PRICING table (value 1; usage deferred until priced).",
+           "gauge", (((lp("model", model),), 1) for model in sorted(unpriced)))
 
     ts = int(time.time())
     for name, helptext, mtype, value in (
-        ("claude_code_sessions_total", "Distinct Claude Code session count.", "counter", len(sessions)),
-        ("claude_code_usage_exporter_unpriced_models", "Count of distinct models seen but absent from the PRICING table (usage counted at $0).", "gauge", len(unpriced)),
+        ("claude_code_sessions_total", "Distinct Claude Code session count.", "counter", len(state["sessions"])),
+        ("claude_code_usage_exporter_unpriced_models", "Count of distinct models seen but absent from the PRICING table (usage deferred).", "gauge", len(unpriced)),
         ("claude_code_usage_exporter_transcripts", "Transcript files parsed in the last run.", "gauge", n_files),
         ("claude_code_usage_exporter_last_run_timestamp_seconds", "Unix time of the last exporter run.", "gauge", ts),
         ("claude_code_usage_exporter_duration_seconds", "Wall-clock seconds of the last exporter run.", "gauge", round(duration, 3)),
@@ -195,17 +343,18 @@ def render(tokens, cost, messages, sessions, unpriced, n_files, duration, host):
     return "\n".join(out) + "\n"
 
 
-def human_summary(tokens, cost, messages, sessions):
+def human_summary(state):
     by_model_cost = defaultdict(float)
     by_entry_cost = defaultdict(float)
     grand_tokens = defaultdict(int)
-    for (model, entry), c in cost.items():
+    for k, c in state["cost"].items():
+        model, entry = k.split(_SEP, 1)
         by_model_cost[model] += c
         by_entry_cost[entry] += c
-    for (model, entry), d in tokens.items():
+    for k, d in state["tokens"].items():
         for t in TYPES:
-            grand_tokens[t] += d[t]
-    lines = [f"sessions: {len(sessions)}   messages: {sum(messages.values())}", ""]
+            grand_tokens[t] += d.get(t, 0)
+    lines = [f"sessions: {len(state['sessions'])}   messages: {sum(state['messages'].values())}", ""]
     lines.append("API-equivalent $ by model:")
     for m, c in sorted(by_model_cost.items(), key=lambda x: -x[1]):
         lines.append(f"  {m:<26} ${c:,.2f}")
@@ -224,19 +373,25 @@ def serve(args):
     The scrape interval replaces the cron entirely. Re-parses at most every
     --cache-ttl seconds (so a fast scrape cadence doesn't re-read the transcripts
     each time). No host label is emitted — the scraper's remote_write adds it.
+
+    State is loaded once at startup and persisted after each parse, so the
+    accumulated counters survive a restart when --state-file is set.
     """
-    state = {"text": "", "ts": None}
+    state = load_state(args.state_file)
+    rendered = {"text": "", "ts": None}
     lock = threading.Lock()
 
     def regen():
         start = time.time()
-        tokens, cost, messages, sessions, unpriced, n_files = parse(args.projects_dir)
+        unpriced, n_files, dirty = update_state(state, args.projects_dir)
         if unpriced:
-            print(f"warning: model(s) absent from pricing table, counted at $0: "
+            print(f"warning: model(s) absent from pricing table, usage deferred: "
                   f"{', '.join(sorted(unpriced))}", file=sys.stderr)
-        state["text"] = render(tokens, cost, messages, sessions, unpriced, n_files,
-                               time.time() - start, args.host)
-        state["ts"] = time.monotonic()
+        if args.state_file and dirty:
+            persist_state(args.state_file, state)
+        rendered["text"] = render(state, unpriced, n_files,
+                                  time.time() - start, args.host)
+        rendered["ts"] = time.monotonic()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -248,9 +403,9 @@ def serve(args):
             if path != "/metrics":
                 return self._send(404, b"not found\n", "text/plain")
             with lock:
-                if state["ts"] is None or time.monotonic() - state["ts"] > args.cache_ttl:
+                if rendered["ts"] is None or time.monotonic() - rendered["ts"] > args.cache_ttl:
                     regen()
-                body = state["text"].encode()
+                body = rendered["text"].encode()
             self._send(200, body, "text/plain; version=0.0.4; charset=utf-8")
 
         def _send(self, code, body, ctype):
@@ -265,7 +420,8 @@ def serve(args):
 
     httpd = http.server.ThreadingHTTPServer((args.listen, args.port), Handler)
     print(f"claude-usage-exporter serving /metrics on {args.listen}:{args.port} "
-          f"(re-parse cached {args.cache_ttl}s)", file=sys.stderr)
+          f"(re-parse cached {args.cache_ttl}s, state={args.state_file or 'in-memory'})",
+          file=sys.stderr)
     httpd.serve_forever()
 
 
@@ -274,7 +430,8 @@ def main():
     ap.add_argument("--projects-dir", default=os.path.expanduser("~/.claude/projects"))
     ap.add_argument("--output", help="Path to write the .prom file (omit with --print/--serve).")
     ap.add_argument("--host", default="", help="Optional host label (set on hosts without alloy external_labels, e.g. Mac).")
-    ap.add_argument("--print", action="store_true", dest="do_print", help="Print a human summary to stdout instead of writing .prom.")
+    ap.add_argument("--state-file", default="", help="Path to the persisted accumulator (JSON). Required for a durable monotonic counter across restarts; omit for in-memory only.")
+    ap.add_argument("--print", action="store_true", dest="do_print", help="Print a human summary to stdout instead of writing .prom (read-only; never persists state).")
     ap.add_argument("--serve", action="store_true", help="Run as an HTTP /metrics server for Prometheus/Alloy to scrape (no cron needed).")
     ap.add_argument("--port", type=int, default=9119, help="Port for --serve (default 9119).")
     ap.add_argument("--listen", default="127.0.0.1", help="Bind address for --serve (default 127.0.0.1 loopback; only a local scraper reaches it).")
@@ -285,26 +442,32 @@ def main():
         serve(args)
         return
 
+    state = load_state(args.state_file)
     start = time.time()
-    tokens, cost, messages, sessions, unpriced, n_files = parse(args.projects_dir)
+    unpriced, n_files, dirty = update_state(state, args.projects_dir)
     duration = time.time() - start
 
     if unpriced:
-        print(f"warning: {len(unpriced)} model(s) absent from pricing table, counted at $0: "
+        print(f"warning: {len(unpriced)} model(s) absent from pricing table, usage deferred: "
               f"{', '.join(sorted(unpriced))} — add them to PRICING.", file=sys.stderr)
 
     if args.do_print:
-        print(human_summary(tokens, cost, messages, sessions))
+        # Read-only view: reflect the latest disk, but never persist from --print
+        # (it may run via `docker exec` alongside a serving process sharing state).
+        print(human_summary(state))
         print(f"\nparsed {n_files} transcripts in {duration:.2f}s")
         return
 
     if not args.output:
         ap.error("--output is required unless --print is given")
 
+    if args.state_file and dirty:
+        persist_state(args.state_file, state)
+
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    text = render(tokens, cost, messages, sessions, unpriced, n_files, duration, args.host)
+    text = render(state, unpriced, n_files, duration, args.host)
     tmp = f"{args.output}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         f.write(text)

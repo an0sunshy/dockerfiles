@@ -9,7 +9,26 @@ permissions:
   packages: write
 
 jobs:
+  # Gate the build on the exporter's unit tests (stdlib-only, no deps) so a
+  # regression — e.g. the counter losing monotonicity — can never ship :latest,
+  # which this workflow pushes unconditionally on every branch push.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run claude-usage-exporter unit tests
+        working-directory: ./claude-usage-exporter
+        run: python -m unittest -v
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
