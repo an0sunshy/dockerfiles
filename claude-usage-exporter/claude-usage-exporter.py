@@ -54,6 +54,8 @@ PRICING = {
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    # Self-hosted models (odin llm-dual LiteLLM router) — no API cost.
+    "smart": (0.0, 0.0),
 }
 CACHE_READ_MULT = 0.1
 CACHE_WRITE_5M_MULT = 1.25
