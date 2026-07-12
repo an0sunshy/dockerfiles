@@ -240,6 +240,20 @@ class MonotonicCounterTest(unittest.TestCase):
         models = {k.split("\x1f")[0] for k in state["cost"]}
         self.assertEqual(models, {"claude-haiku-4-5"})
 
+    def test_local_lane_alias_priced_under_official_name(self):
+        """A legacy local lane name ("smart") must be remapped to the official
+        OpenRouter id and priced at its imputed rates, not deferred as unpriced."""
+        write_msg(self.d, "a.jsonl", "msg-a", model="smart")
+        state = cue.empty_state()
+        unpriced, _, _ = cue.update_state(state, self.d)
+        self.assertEqual(unpriced, set())
+        models = {k.split("\x1f")[0] for k in state["cost"]}
+        self.assertEqual(models, {"qwen/qwen3.6-35b-a3b"})
+        p_in, p_out = cue.PRICING["qwen/qwen3.6-35b-a3b"]
+        expected = (1000 * p_in + 500 * p_out + 200000 * p_in * 0.1
+                    + 100 * p_in * 1.25) / 1_000_000.0
+        self.assertAlmostEqual(total_cost(state), expected, places=9)
+
     def test_dirty_flag_tracks_new_activity(self):
         """update_state reports dirty=True only when it folds in new usage, so
         --serve can skip rewriting a growing state file on idle scrapes."""

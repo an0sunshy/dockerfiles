@@ -54,8 +54,17 @@ PRICING = {
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
-    # Self-hosted models (odin llm-dual LiteLLM router) — no API cost.
-    "smart": (0.0, 0.0),
+    # Self-hosted local models, keyed by official OpenRouter id and priced at
+    # OpenRouter list rates as imputed cost (openrouter.ai/api/v1/models,
+    # cached 2026-07-12). Not real spend - the dashboard can split on model.
+    "qwen/qwen3.6-35b-a3b": (0.14, 1.0),
+}
+
+# Legacy lane aliases served by the odin LiteLLM router, mapped to the official
+# OpenRouter model id. New local lanes should use the official id directly
+# (base model name, quantization/variant suffixes trimmed) so no alias is needed.
+LOCAL_MODEL_ALIASES = {
+    "smart": "qwen/qwen3.6-35b-a3b",
 }
 CACHE_READ_MULT = 0.1
 CACHE_WRITE_5M_MULT = 1.25
@@ -76,6 +85,7 @@ def normalize_model(model):
     """Strip a dated snapshot suffix (e.g. claude-haiku-4-5-20251001)."""
     if not model:
         return "unknown"
+    model = LOCAL_MODEL_ALIASES.get(model, model)
     for known in PRICING:
         if model == known or model.startswith(known + "-"):
             return known
