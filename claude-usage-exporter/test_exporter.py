@@ -30,11 +30,16 @@ def _load():
 
 cue = _load()
 
-# Cost of one canonical opus-4-8 message, computed from PRICING the same way the
-# exporter does, so tests assert exact deltas rather than magic numbers.
-#   input 1000*$5 + output 500*$25 + cache_read 200000*$5*0.1
-#   + cache_write_5m 100*$5*1.25  (all /1e6)
-ONE_MSG_USD = (1000 * 5 + 500 * 25 + 200000 * 5 * 0.1 + 100 * 5 * 1.25) / 1_000_000.0
+# Cost of one canonical message (the token counts write_msg emits) at the given
+# $/1M rates, computed the same way the exporter does, so tests assert exact
+# deltas rather than magic numbers: input 1000 + output 500 +
+# cache_read 200000 (0.1x) + cache_write_5m 100 (1.25x).
+def one_msg_cost(p_in, p_out):
+    return (1000 * p_in + 500 * p_out + 200000 * p_in * 0.1
+            + 100 * p_in * 1.25) / 1_000_000.0
+
+
+ONE_MSG_USD = one_msg_cost(5.0, 25.0)  # canonical opus-4-8 message
 
 
 def write_msg(d, name, msg_id, model="claude-opus-4-8", req=None, session=None,
@@ -250,9 +255,21 @@ class MonotonicCounterTest(unittest.TestCase):
         models = {k.split("\x1f")[0] for k in state["cost"]}
         self.assertEqual(models, {"qwen/qwen3.6-35b-a3b"})
         p_in, p_out = cue.PRICING["qwen/qwen3.6-35b-a3b"]
-        expected = (1000 * p_in + 500 * p_out + 200000 * p_in * 0.1
-                    + 100 * p_in * 1.25) / 1_000_000.0
-        self.assertAlmostEqual(total_cost(state), expected, places=9)
+        self.assertAlmostEqual(total_cost(state), one_msg_cost(p_in, p_out),
+                               places=9)
+
+    def test_official_id_local_model_priced_directly(self):
+        """A local model recorded under its official OpenRouter id needs no
+        alias and must price at its imputed rates, not defer as unpriced."""
+        write_msg(self.d, "a.jsonl", "msg-a", model="deepseek/deepseek-v4-flash")
+        state = cue.empty_state()
+        unpriced, _, _ = cue.update_state(state, self.d)
+        self.assertEqual(unpriced, set())
+        models = {k.split("\x1f")[0] for k in state["cost"]}
+        self.assertEqual(models, {"deepseek/deepseek-v4-flash"})
+        p_in, p_out = cue.PRICING["deepseek/deepseek-v4-flash"]
+        self.assertAlmostEqual(total_cost(state), one_msg_cost(p_in, p_out),
+                               places=9)
 
     def test_dirty_flag_tracks_new_activity(self):
         """update_state reports dirty=True only when it folds in new usage, so

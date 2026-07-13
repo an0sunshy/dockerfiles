@@ -58,6 +58,7 @@ PRICING = {
     # OpenRouter list rates as imputed cost (openrouter.ai/api/v1/models,
     # cached 2026-07-12). Not real spend - the dashboard can split on model.
     "qwen/qwen3.6-35b-a3b": (0.14, 1.0),
+    "deepseek/deepseek-v4-flash": (0.077, 0.154),
 }
 
 # Legacy lane aliases served by the odin LiteLLM router, mapped to the official
