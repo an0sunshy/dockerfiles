@@ -245,6 +245,38 @@ class MonotonicCounterTest(unittest.TestCase):
         models = {k.split("\x1f")[0] for k in state["cost"]}
         self.assertEqual(models, {"claude-haiku-4-5"})
 
+    def test_pricing_keys_are_matcher_safe(self):
+        """No PRICING key may be a prefix of another under normalize_model's
+        `startswith(known + "-")` rule.
+
+        normalize_model iterates PRICING in insertion order and returns the
+        first match, so a key that prefixes a later key would make the later
+        one unreachable - it would silently price under the wrong id and never
+        reach `unpriced`, so ClaudeUsageUnpricedModel could not catch it. This
+        guards the table only; it cannot detect the related hazard of a key
+        shadowing a future model id that is absent from the table (e.g.
+        claude-opus-5 absorbing a future claude-opus-5-1), which needs a
+        stricter suffix rule than dict ordering can express.
+        """
+        keys = list(cue.PRICING)
+        shadowed = [(a, b) for a in keys for b in keys
+                    if a != b and b.startswith(a + "-")]
+        self.assertEqual(shadowed, [], f"PRICING key shadows another: {shadowed}")
+
+    def test_dated_snapshot_of_every_pricing_key_resolves_to_itself(self):
+        """A dated snapshot must normalize back onto its base key.
+
+        Anthropic ships ids both bare and dated (claude-haiku-4-5 /
+        claude-haiku-4-5-20251001). If a key stopped absorbing its own dated
+        form the usage would split across two model labels, one of them
+        unpriced. normalize_model had no direct test coverage before this.
+        """
+        for key in cue.PRICING:
+            if "/" in key:
+                continue  # local OpenRouter ids are not date-snapshotted
+            self.assertEqual(cue.normalize_model(key), key)
+            self.assertEqual(cue.normalize_model(key + "-20260301"), key)
+
     def test_local_lane_alias_priced_under_official_name(self):
         """A legacy local lane name ("smart") must be remapped to the official
         OpenRouter id and priced at its imputed rates, not deferred as unpriced."""
