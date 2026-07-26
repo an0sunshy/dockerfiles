@@ -42,10 +42,15 @@ import time
 from collections import defaultdict
 
 # Base list pricing, $ per 1M tokens (input, output).
-# Source: claude-api skill model table (cached 2026-07-03). Cache rates derived
-# from documented multipliers: read 0.1x, write-5m 1.25x, write-1h 2.0x of input.
+# Every rate below verified 2026-07-26 against platform.claude.com's models
+# overview. (The claude-api skill's own table is a cache with an older stamp and
+# omits some entries here, so it is not the citable source for this table.)
+# Cache rates derived from documented multipliers: read 0.1x, write-5m 1.25x,
+# write-1h 2.0x of input. Base list pricing - note claude-sonnet-5 carries
+# introductory $2/$10 through 2026-08-31, so its imputed cost reads high until then.
 PRICING = {
     "claude-fable-5":   (10.0, 50.0),
+    "claude-opus-5":    (5.0, 25.0),
     "claude-opus-4-8":  (5.0, 25.0),
     "claude-opus-4-7":  (5.0, 25.0),
     "claude-opus-4-6":  (5.0, 25.0),
