@@ -36,6 +36,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -72,6 +73,54 @@ PRICING = {
 LOCAL_MODEL_ALIASES = {
     "smart": "qwen/qwen3.6-35b-a3b",
 }
+
+# Per-tier fallback rates, $ per 1M tokens (input, output). Values are the rates
+# the PRICING entries above already share within each tier, so this adds no
+# unverified price claim - it only says a new generation bills like the current
+# one. Anthropic has held that across every generation listed above (opus 4-5 ->
+# 5, sonnet 4-5 -> 5, haiku 4-5).
+#
+# Why this exists: without it a model released today is DEFERRED - held
+# uncounted, recoverable only while its transcripts survive Claude Code's
+# retention window. That is a countdown, not a cosmetic undercount, and it is
+# what left claude-opus-5 uncounted from 2026-07-25 to 2026-07-29. A tier match
+# prices it on day one; token and message counts were always exact and stay so.
+#
+# Note the evidence is not equally strong across the three: opus and sonnet each
+# have four priced generations behind them, haiku exactly one. That argues for
+# alerting on every imputed rate, not for dropping the haiku arm.
+#
+# claude-fable-* is deliberately absent. Fable 5 is $10/$50 and already breaks
+# the tier pattern the other three share, so a hypothetical claude-fable-6 falls
+# through to deferral - the conservative outcome for a line whose pricing we
+# cannot extrapolate. Unknown vendors and local models keep deferring too.
+# Rationale and phasing: ansible-scripts docs/model-pricing-automation.md.
+TIER_PRICING = {
+    "opus":   (5.0, 25.0),
+    "sonnet": (3.0, 15.0),
+    "haiku":  (1.0, 5.0),
+}
+
+# A dated snapshot suffix, e.g. the -20251001 of claude-haiku-4-5-20251001. This
+# is the ONLY suffix normalize_model strips. It used to strip any suffix under a
+# PRICING key, which silently folded a dot-release into its parent: claude-opus-5-1
+# resolved to claude-opus-5, priced exact, landed on the wrong `model` label, and
+# could reach neither alert. The Opus line ships dot-releases (4-5, 4-6, 4-7, 4-8),
+# so that was aimed squarely at the next release.
+_SNAPSHOT_RE = re.compile(r"-\d{8}$")
+
+# claude-<tier>-<version>, e.g. claude-opus-4-5, claude-sonnet-5, claude-opus-5-1.
+# The tier is captured rather than enumerated, so TIER_PRICING stays the single
+# place deciding which tiers may be imputed - an unrecognised tier shape-matches
+# here, finds no rate, and defers.
+#
+# Anchored, so anything carrying an extra qualifier - a bracketed context variant
+# like claude-opus-5[1m], a -fast suffix - fails to match and defers rather than
+# being priced at the base rate. Note this is a guard against a plausible naming,
+# not an observed one: no bracketed id appears in any transcript on this fleet
+# today, and a 1M-context session records plain claude-opus-5, so long-context
+# usage is currently priced at the base rate regardless.
+_MODEL_RE = re.compile(r"^claude-([a-z]+)-\d+(?:-\d+)*$")
 CACHE_READ_MULT = 0.1
 CACHE_WRITE_5M_MULT = 1.25
 CACHE_WRITE_1H_MULT = 2.0
@@ -88,14 +137,34 @@ _SEP = "\x1f"
 
 
 def normalize_model(model):
-    """Strip a dated snapshot suffix (e.g. claude-haiku-4-5-20251001)."""
+    """Strip a dated snapshot suffix (e.g. claude-haiku-4-5-20251001).
+
+    A dated snapshot is the ONLY thing stripped, so every snapshot of a release
+    aggregates into one series instead of fanning out per date, while a
+    dot-release or qualified variant stays its own model rather than being
+    folded into a parent it may not share a price with.
+    """
     if not model:
         return "unknown"
     model = LOCAL_MODEL_ALIASES.get(model, model)
-    for known in PRICING:
-        if model == known or model.startswith(known + "-"):
-            return known
-    return model
+    return _SNAPSHOT_RE.sub("", model)
+
+
+def resolve_price(model):
+    """Return ((input, output), tier) for a model, or (None, None).
+
+    tier is None for an exact PRICING hit and the tier name (e.g. "opus") when
+    the rate was imputed from TIER_PRICING. Callers surface the imputed case
+    separately so an estimate is never mistaken for a verified rate.
+    """
+    if model in PRICING:
+        return PRICING[model], None
+    m = _MODEL_RE.match(model)
+    if m:
+        tier = m.group(1)
+        if tier in TIER_PRICING:
+            return TIER_PRICING[tier], tier
+    return None, None
 
 
 def _ident_hash(s):
@@ -193,7 +262,8 @@ def update_state(state, projects_dir):
 
     Only NEW message identities are added — deletions never subtract, re-parses
     never double-count — so the accumulated totals are monotonic. Returns the set
-    of unpriced models seen on disk this run (a gauge; not banked), the file
+    of unpriced models seen on disk this run (a gauge; not banked), a {model:
+    tier} map of those priced from a tier rate rather than a pinned one, the file
     count, and whether the accumulator changed (so callers skip a no-op save).
     """
     tokens = state["tokens"]
@@ -202,7 +272,7 @@ def update_state(state, projects_dir):
     seen = state["seen"]
     sessions = state["sessions"]
     baseline = len(seen) + len(sessions)  # to report whether anything new was folded in
-    unpriced = set()  # models on disk absent from PRICING — deferred, not counted
+    unpriced = set()  # models resolving to no rate at all — deferred, not counted
     files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
 
     for fp in files:
@@ -240,10 +310,12 @@ def update_state(state, projects_dir):
                     sid = o.get("sessionId")
                     if sid:
                         sessions.add(_ident_hash(sid))
-                    if model not in PRICING:
+                    rate, tier = resolve_price(model)
+                    if rate is None:
                         # Defer: don't bank at $0 (which would freeze this cost
-                        # forever) and don't mark seen — once PRICING gains the
-                        # model, a later run counts it while it's still on disk.
+                        # forever) and don't mark seen — once the model resolves
+                        # to a rate, a later run counts it while it's still on
+                        # disk. Only ids matching no priced tier reach here.
                         unpriced.add(model)
                         continue
 
@@ -273,7 +345,7 @@ def update_state(state, projects_dir):
                     td["cache_write_1h"] += c1h
                     messages[k] = messages.get(k, 0) + 1
 
-                    p_in, p_out = PRICING[model]
+                    p_in, p_out = rate
                     cost[k] = cost.get(k, 0.0) + (
                         inp * p_in
                         + cread * p_in * CACHE_READ_MULT
@@ -285,10 +357,36 @@ def update_state(state, projects_dir):
             continue
 
     dirty = (len(seen) + len(sessions)) != baseline  # only-add, so != means grew
-    return unpriced, len(files), dirty
+    return unpriced, imputed_models(state), len(files), dirty
 
 
-def render(state, unpriced, n_files, duration, host):
+def imputed_models(state):
+    """{model: tier} for every model in the accumulator priced at a tier rate.
+
+    Derived from the banked state, NOT from what this run happened to fold in.
+    That distinction is the whole alert: an imputed message is banked and marked
+    seen, so a per-run set would report the model once and read 0 on every
+    later scrape — the gauge would collapse a scrape after the model appeared,
+    its `for:` clock would reset constantly, and ClaudeUsageImputedPrice could
+    never fire. (unpriced is safe as a per-run set only because deferred
+    messages are deliberately never marked seen, so they re-derive every run.)
+
+    Reading it off the accumulator makes it a stock, not a flow: it stays set
+    for as long as estimated dollars sit in the counter, survives a restart via
+    the state file, and self-clears the moment PRICING gains a real rate.
+    """
+    out = {}
+    for key in state["cost"]:
+        model = key.split(_SEP, 1)[0]
+        if model in out:
+            continue
+        _, tier = resolve_price(model)
+        if tier:
+            out[model] = tier
+    return out
+
+
+def render(state, unpriced, imputed, n_files, duration, host):
     """Render Prometheus text-exposition format from the accumulated state.
 
     On hosts running alloy-remote, `host` is added by remote_write external_labels,
@@ -345,13 +443,22 @@ def render(state, unpriced, n_files, duration, host):
     # series; when one appears, alerting fires on the scalar gauge below and reads
     # the model name here.
     family("claude_code_unpriced_model_info",
-           "Models seen in transcripts but absent from the PRICING table (value 1; usage deferred until priced).",
+           "Models with no rate, neither pinned nor imputable from a tier (value 1; usage deferred until priced).",
            "gauge", (((lp("model", model),), 1) for model in sorted(unpriced)))
+
+    # Info series (value 1) naming each model counted at its tier's rate rather
+    # than a pinned one — usage IS counted, but the dollar figure is an estimate.
+    # Pinning the published rate in PRICING clears it.
+    family("claude_code_imputed_price_model_info",
+           "Models priced from their tier's rate rather than a pinned one (value 1; cost is imputed).",
+           "gauge", (((lp("model", model), lp("tier", tier)), 1)
+                     for model, tier in sorted(imputed.items())))
 
     ts = int(time.time())
     for name, helptext, mtype, value in (
         ("claude_code_sessions_total", "Distinct Claude Code session count.", "counter", len(state["sessions"])),
-        ("claude_code_usage_exporter_unpriced_models", "Count of distinct models seen but absent from the PRICING table (usage deferred).", "gauge", len(unpriced)),
+        ("claude_code_usage_exporter_unpriced_models", "Count of distinct models with no rate, neither pinned nor imputable from a tier (usage deferred).", "gauge", len(unpriced)),
+        ("claude_code_usage_exporter_imputed_price_models", "Count of distinct models counted at their tier's rate rather than a pinned one (cost imputed).", "gauge", len(imputed)),
         ("claude_code_usage_exporter_transcripts", "Transcript files parsed in the last run.", "gauge", n_files),
         ("claude_code_usage_exporter_last_run_timestamp_seconds", "Unix time of the last exporter run.", "gauge", ts),
         ("claude_code_usage_exporter_duration_seconds", "Wall-clock seconds of the last exporter run.", "gauge", round(duration, 3)),
@@ -401,13 +508,16 @@ def serve(args):
 
     def regen():
         start = time.time()
-        unpriced, n_files, dirty = update_state(state, args.projects_dir)
+        unpriced, imputed, n_files, dirty = update_state(state, args.projects_dir)
         if unpriced:
             print(f"warning: model(s) absent from pricing table, usage deferred: "
                   f"{', '.join(sorted(unpriced))}", file=sys.stderr)
+        if imputed:
+            print(f"note: model(s) priced at their tier rate, cost is imputed: "
+                  f"{', '.join(sorted(imputed))}", file=sys.stderr)
         if args.state_file and dirty:
             persist_state(args.state_file, state)
-        rendered["text"] = render(state, unpriced, n_files,
+        rendered["text"] = render(state, unpriced, imputed, n_files,
                                   time.time() - start, args.host)
         rendered["ts"] = time.monotonic()
 
@@ -462,12 +572,17 @@ def main():
 
     state = load_state(args.state_file)
     start = time.time()
-    unpriced, n_files, dirty = update_state(state, args.projects_dir)
+    unpriced, imputed, n_files, dirty = update_state(state, args.projects_dir)
     duration = time.time() - start
 
     if unpriced:
         print(f"warning: {len(unpriced)} model(s) absent from pricing table, usage deferred: "
               f"{', '.join(sorted(unpriced))} — add them to PRICING.", file=sys.stderr)
+
+    if imputed:
+        print(f"note: {len(imputed)} model(s) priced at their tier rate, cost is imputed: "
+              f"{', '.join(sorted(imputed))} — pin the published rate in PRICING.",
+              file=sys.stderr)
 
     if args.do_print:
         # Read-only view: reflect the latest disk, but never persist from --print
@@ -485,7 +600,7 @@ def main():
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    text = render(state, unpriced, n_files, duration, args.host)
+    text = render(state, unpriced, imputed, n_files, duration, args.host)
     tmp = f"{args.output}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         f.write(text)
