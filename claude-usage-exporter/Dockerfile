@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL maintainer="an0sunshy <an0sunshy@gmail.com>"
 LABEL org.opencontainers.image.source=https://github.com/an0sunshy/dockerfiles
-LABEL org.opencontainers.image.description="Claude Code usage/cost exporter — parses ~/.claude/projects transcripts into Prometheus metrics"
+LABEL org.opencontainers.image.description="Claude Code token usage exporter — parses ~/.claude/projects transcripts into Prometheus metrics (pricing is server-side)"
 
 # stdlib-only; no requirements to install
 COPY claude-usage-exporter.py /app/claude-usage-exporter.py

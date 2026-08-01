@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the Claude usage exporter's durable, monotonic counter.
+"""Tests for the Claude usage exporter's durable, monotonic token counter.
 
 Run: python3 -m unittest -v   (from this directory)
 
@@ -8,6 +8,10 @@ transcript store on disk shrinks (sessions cleared/pruned, `/clear`), so a naive
 recompute-from-disk drops -> Prometheus reads a reset -> increase()/rate() inflate.
 These tests pin the two guarantees that fix it: deletions never subtract, and new
 activity after a prune is still counted (i.e. not a value that merely ratchets).
+
+They also pin the property the pricing split depends on: EVERY model is banked,
+including ids this build has never heard of. Prices live server-side, so an
+unknown id is the normal case; anything dropped here can never be priced later.
 """
 import importlib.util
 import json
@@ -30,16 +34,8 @@ def _load():
 
 cue = _load()
 
-# Cost of one canonical message (the token counts write_msg emits) at the given
-# $/1M rates, computed the same way the exporter does, so tests assert exact
-# deltas rather than magic numbers: input 1000 + output 500 +
-# cache_read 200000 (0.1x) + cache_write_5m 100 (1.25x).
-def one_msg_cost(p_in, p_out):
-    return (1000 * p_in + 500 * p_out + 200000 * p_in * 0.1
-            + 100 * p_in * 1.25) / 1_000_000.0
-
-
-ONE_MSG_USD = one_msg_cost(5.0, 25.0)  # canonical opus-4-8 message
+# Token counts written by write_msg below, summed across all five buckets.
+ONE_MSG_TOKENS = 1000 + 500 + 200000 + 100
 
 
 def write_msg(d, name, msg_id, model="claude-opus-4-8", req=None, session=None,
@@ -68,16 +64,16 @@ def write_msg(d, name, msg_id, model="claude-opus-4-8", req=None, session=None,
         f.write(json.dumps(rec) + "\n")
 
 
-def total_cost(state):
-    return sum(state["cost"].values())
-
-
 def total_tokens(state):
     return sum(sum(v.values()) for v in state["tokens"].values())
 
 
 def total_messages(state):
     return sum(state["messages"].values())
+
+
+def models_in(state):
+    return {k.split("\x1f")[0] for k in state["tokens"]}
 
 
 class MonotonicCounterTest(unittest.TestCase):
@@ -90,21 +86,20 @@ class MonotonicCounterTest(unittest.TestCase):
         write_msg(self.d, "b.jsonl", "msg-b")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        c1, t1 = total_cost(state), total_tokens(state)
-        self.assertGreater(c1, 0)
+        t1 = total_tokens(state)
+        self.assertGreater(t1, 0)
 
         os.remove(os.path.join(self.d, "a.jsonl"))  # session cleared / pruned
         cue.update_state(state, self.d)
-        self.assertEqual(total_cost(state), c1)   # not dropped
-        self.assertEqual(total_tokens(state), t1)
+        self.assertEqual(total_tokens(state), t1)   # not dropped
 
     def test_reparse_same_disk_is_idempotent(self):
         write_msg(self.d, "a.jsonl", "msg-a")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        c1, m1 = total_cost(state), total_messages(state)
+        t1, m1 = total_tokens(state), total_messages(state)
         cue.update_state(state, self.d)          # nothing new on disk
-        self.assertAlmostEqual(total_cost(state), c1)
+        self.assertEqual(total_tokens(state), t1)
         self.assertEqual(total_messages(state), m1)
 
     def test_new_activity_after_prune_is_counted(self):
@@ -114,12 +109,12 @@ class MonotonicCounterTest(unittest.TestCase):
         write_msg(self.d, "b.jsonl", "msg-b")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        c1 = total_cost(state)
+        t1 = total_tokens(state)
 
         os.remove(os.path.join(self.d, "a.jsonl"))
         write_msg(self.d, "c.jsonl", "msg-c")    # new session after the prune
         cue.update_state(state, self.d)
-        self.assertAlmostEqual(total_cost(state), c1 + ONE_MSG_USD, places=6)
+        self.assertEqual(total_tokens(state), t1 + ONE_MSG_TOKENS)
 
     def test_persist_and_reload_roundtrip(self):
         write_msg(self.d, "a.jsonl", "msg-a")
@@ -130,12 +125,11 @@ class MonotonicCounterTest(unittest.TestCase):
         cue.save_state(path, state)
 
         reloaded = cue.load_state(path)
-        self.assertAlmostEqual(total_cost(reloaded), total_cost(state))
         self.assertEqual(total_tokens(reloaded), total_tokens(state))
         self.assertEqual(total_messages(reloaded), total_messages(state))
         # dedup memory survived: re-parsing the same disk adds nothing
         cue.update_state(reloaded, self.d)
-        self.assertAlmostEqual(total_cost(reloaded), total_cost(state))
+        self.assertEqual(total_tokens(reloaded), total_tokens(state))
 
     def test_durable_across_restart_and_deletion(self):
         """Simulate a container restart (fresh process loads state file) that
@@ -144,18 +138,18 @@ class MonotonicCounterTest(unittest.TestCase):
         write_msg(self.d, "b.jsonl", "msg-b")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        c1 = total_cost(state)
+        t1 = total_tokens(state)
         path = os.path.join(self.d, "state.json")
         cue.save_state(path, state)
 
         os.remove(os.path.join(self.d, "a.jsonl"))   # pruned while "down"
         restarted = cue.load_state(path)             # fresh process
         cue.update_state(restarted, self.d)
-        self.assertEqual(total_cost(restarted), c1)  # still reflects both msgs
+        self.assertEqual(total_tokens(restarted), t1)  # still reflects both msgs
 
     def test_load_missing_state_is_empty(self):
         state = cue.load_state(os.path.join(self.d, "does-not-exist.json"))
-        self.assertEqual(total_cost(state), 0)
+        self.assertEqual(total_tokens(state), 0)
         self.assertEqual(total_messages(state), 0)
 
     def test_load_corrupt_state_is_empty(self):
@@ -163,17 +157,16 @@ class MonotonicCounterTest(unittest.TestCase):
         with open(path, "w") as f:
             f.write("{not valid json")
         state = cue.load_state(path)   # must not raise
-        self.assertEqual(total_cost(state), 0)
+        self.assertEqual(total_tokens(state), 0)
 
     def test_load_wrong_shape_state_is_empty(self):
         """Valid JSON, wrong schema (tokens value isn't a dict) must degrade to
         empty via the load guard, not crash the process."""
         path = os.path.join(self.d, "state.json")
         with open(path, "w") as f:
-            json.dump({"version": 1, "tokens": {"m\x1fe": 5},
-                       "cost": {}, "messages": {}}, f)
+            json.dump({"version": 1, "tokens": {"m\x1fe": 5}, "messages": {}}, f)
         state = cue.load_state(path)   # must not raise
-        self.assertEqual(total_cost(state), 0)
+        self.assertEqual(total_tokens(state), 0)
         self.assertEqual(total_messages(state), 0)
 
     def test_empty_projects_dir_does_not_zero_counter(self):
@@ -182,12 +175,12 @@ class MonotonicCounterTest(unittest.TestCase):
         write_msg(self.d, "a.jsonl", "msg-a")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        c1 = total_cost(state)
-        self.assertGreater(c1, 0)
+        t1 = total_tokens(state)
+        self.assertGreater(t1, 0)
         empty = tempfile.mkdtemp()
-        _, _, _, dirty = cue.update_state(state, empty)
+        _, dirty = cue.update_state(state, empty)
         self.assertFalse(dirty)
-        self.assertEqual(total_cost(state), c1)   # not zeroed
+        self.assertEqual(total_tokens(state), t1)   # not zeroed
 
     def test_print_mode_never_persists_state(self):
         """--print is a read-only debug view (may run via `docker exec` beside a
@@ -201,24 +194,6 @@ class MonotonicCounterTest(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(os.path.exists(state_path))
-
-    def test_unpriced_model_is_deferred_not_banked(self):
-        """An unknown model must not be banked at $0 (which would freeze its cost
-        forever). It stays uncounted until PRICING gains it, then is picked up."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="future-model-9")
-        state = cue.empty_state()
-        unpriced, _, _, _ = cue.update_state(state, self.d)
-        self.assertIn("future-model-9", unpriced)
-        self.assertEqual(total_cost(state), 0)
-        self.assertEqual(total_messages(state), 0)   # not banked
-
-        # Operator adds pricing and redeploys the image; message is still on disk.
-        cue.PRICING["future-model-9"] = (3.0, 15.0)
-        self.addCleanup(lambda: cue.PRICING.pop("future-model-9", None))
-        unpriced2, _, _, _ = cue.update_state(state, self.d)
-        self.assertNotIn("future-model-9", unpriced2)
-        self.assertGreater(total_cost(state), 0)
-        self.assertEqual(total_messages(state), 1)   # counted exactly once
 
     def test_keyless_message_not_double_counted(self):
         """A usage record with no id/requestId still must dedup across runs
@@ -238,22 +213,56 @@ class MonotonicCounterTest(unittest.TestCase):
         cue.update_state(state, self.d)   # second scrape, same line
         self.assertEqual(total_messages(state), 1)
 
+    def test_dirty_flag_tracks_new_activity(self):
+        """update_state reports dirty=True only when it folds in new usage, so
+        --serve can skip rewriting a growing state file on idle scrapes."""
+        write_msg(self.d, "a.jsonl", "msg-a")
+        state = cue.empty_state()
+        _, dirty_first = cue.update_state(state, self.d)
+        self.assertTrue(dirty_first)
+        _, dirty_noop = cue.update_state(state, self.d)   # same disk
+        self.assertFalse(dirty_noop)
+        write_msg(self.d, "b.jsonl", "msg-b")
+        _, dirty_after = cue.update_state(state, self.d)
+        self.assertTrue(dirty_after)
+
+    def test_render_emits_counter_with_accumulated_value(self):
+        write_msg(self.d, "a.jsonl", "msg-a")
+        state = cue.empty_state()
+        cue.update_state(state, self.d)
+        text = cue.render(state, 1, 0.01, "testhost")
+        self.assertIn("# TYPE claude_code_tokens_total counter", text)
+        self.assertIn('host="testhost"', text)
+        self.assertIn("claude-opus-4-8", text)
+
+    def test_synthetic_model_is_skipped(self):
+        """"<synthetic>" records carry no real usage and must not create a series
+        (they would otherwise show up server-side as an unpriced model)."""
+        write_msg(self.d, "a.jsonl", "msg-a", model="<synthetic>")
+        state = cue.empty_state()
+        cue.update_state(state, self.d)
+        self.assertEqual(total_messages(state), 0)
+        self.assertEqual(models_in(state), set())
+
+
+class ModelNamingTest(unittest.TestCase):
+    """normalize_model decides the `model` label, which is the join key the
+    server's price rules match on. A name that normalizes wrong is unpriced."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
     def test_dated_model_snapshot_normalizes(self):
         write_msg(self.d, "a.jsonl", "msg-a", model="claude-haiku-4-5-20251001")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        models = {k.split("\x1f")[0] for k in state["cost"]}
-        self.assertEqual(models, {"claude-haiku-4-5"})
+        self.assertEqual(models_in(state), {"claude-haiku-4-5"})
 
     def test_normalize_strips_nothing_but_a_dated_snapshot(self):
         """The whole normalization rule, pinned directly.
 
-        This replaces an invariant that asserted no PRICING key was a prefix of
-        another - a guard made necessary by the old `startswith(known + "-")`
-        matcher, and one that by its own admission could not catch the hazard
-        that actually mattered (a key absorbing a future id absent from the
-        table). The matcher no longer does prefix matching, so the rule it
-        guarded is gone; this pins the replacement instead.
+        A dot-release must stay distinct from its parent: they need not share a
+        price, and the server prices per id.
         """
         self.assertEqual(cue.normalize_model("claude-opus-4-5-20260301"),
                          "claude-opus-4-5")          # dated snapshot: stripped
@@ -262,249 +271,151 @@ class MonotonicCounterTest(unittest.TestCase):
                           "claude-opus-5-2026030"):  # 7 digits, not a snapshot
             self.assertEqual(cue.normalize_model(unchanged), unchanged)
 
-    def test_dated_snapshot_of_every_pricing_key_resolves_to_itself(self):
-        """A dated snapshot must normalize back onto its base key.
+    def test_dated_snapshot_normalizes_back_onto_its_base_id(self):
+        """Anthropic ships ids both bare and dated (claude-haiku-4-5 /
+        claude-haiku-4-5-20251001). If a base id stopped absorbing its own dated
+        form the usage would split across two model labels, and the server would
+        price only one of them."""
+        for base in ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5",
+                     "claude-fable-5", "claude-opus-5-1"):
+            self.assertEqual(cue.normalize_model(base), base)
+            self.assertEqual(cue.normalize_model(base + "-20260301"), base)
 
-        Anthropic ships ids both bare and dated (claude-haiku-4-5 /
-        claude-haiku-4-5-20251001). If a key stopped absorbing its own dated
-        form the usage would split across two model labels, one of them
-        unpriced. normalize_model had no direct test coverage before this.
-        """
-        for key in cue.PRICING:
-            if "/" in key:
-                continue  # local OpenRouter ids are not date-snapshotted
-            self.assertEqual(cue.normalize_model(key), key)
-            self.assertEqual(cue.normalize_model(key + "-20260301"), key)
-
-    def test_local_lane_alias_priced_under_official_name(self):
+    def test_local_lane_alias_lands_on_the_official_id(self):
         """A legacy local lane name ("smart") must be remapped to the official
-        OpenRouter id and priced at its imputed rates, not deferred as unpriced."""
+        OpenRouter id, which is what the server's price rules key on."""
         write_msg(self.d, "a.jsonl", "msg-a", model="smart")
         state = cue.empty_state()
-        unpriced, _, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(unpriced, set())
-        models = {k.split("\x1f")[0] for k in state["cost"]}
-        self.assertEqual(models, {"qwen/qwen3.6-35b-a3b"})
-        p_in, p_out = cue.PRICING["qwen/qwen3.6-35b-a3b"]
-        self.assertAlmostEqual(total_cost(state), one_msg_cost(p_in, p_out),
-                               places=9)
-
-    def test_official_id_local_model_priced_directly(self):
-        """A local model recorded under its official OpenRouter id needs no
-        alias and must price at its imputed rates, not defer as unpriced."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="deepseek/deepseek-v4-flash")
-        state = cue.empty_state()
-        unpriced, _, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(unpriced, set())
-        models = {k.split("\x1f")[0] for k in state["cost"]}
-        self.assertEqual(models, {"deepseek/deepseek-v4-flash"})
-        p_in, p_out = cue.PRICING["deepseek/deepseek-v4-flash"]
-        self.assertAlmostEqual(total_cost(state), one_msg_cost(p_in, p_out),
-                               places=9)
-
-    def test_dirty_flag_tracks_new_activity(self):
-        """update_state reports dirty=True only when it folds in new usage, so
-        --serve can skip rewriting a growing state file on idle scrapes."""
-        write_msg(self.d, "a.jsonl", "msg-a")
-        state = cue.empty_state()
-        _, _, _, dirty_first = cue.update_state(state, self.d)
-        self.assertTrue(dirty_first)
-        _, _, _, dirty_noop = cue.update_state(state, self.d)   # same disk
-        self.assertFalse(dirty_noop)
-        write_msg(self.d, "b.jsonl", "msg-b")
-        _, _, _, dirty_after = cue.update_state(state, self.d)
-        self.assertTrue(dirty_after)
-
-    def test_render_emits_counter_with_accumulated_value(self):
-        write_msg(self.d, "a.jsonl", "msg-a")
-        state = cue.empty_state()
         cue.update_state(state, self.d)
-        text = cue.render(state, set(), {}, 1, 0.01, "testhost")
-        self.assertIn("# TYPE claude_code_cost_usd_total counter", text)
-        self.assertIn('host="testhost"', text)
-        self.assertIn('claude-opus-4-8', text)
+        self.assertEqual(models_in(state), {"qwen/qwen3.6-35b-a3b"})
+
+    def test_empty_model_becomes_unknown(self):
+        self.assertEqual(cue.normalize_model(None), "unknown")
+        self.assertEqual(cue.normalize_model(""), "unknown")
 
 
-class TierFallbackPricingTest(unittest.TestCase):
-    """A model released today must be counted today.
+class ServerSidePricingContractTest(unittest.TestCase):
+    """The exporter must ship NO prices and drop NO tokens.
 
-    Before the fallback, an id absent from PRICING was deferred until someone
-    edited the table, pushed, rebuilt the image, and redeployed every host -
-    which left claude-opus-5 uncounted for four days. These pin that a
-    Claude-shaped id prices from its tier immediately, that the estimate is
-    reported as an estimate, and that the deferral still protects the cases
-    where guessing would be wrong.
+    Both halves matter. Dropping a token loses usage the server can never price;
+    shipping a price recreates the second registry that made every model release
+    a fleet-wide image rollout.
     """
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
 
-    def test_unreleased_claude_model_is_priced_from_its_tier(self):
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-9")
-        state = cue.empty_state()
-        unpriced, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(unpriced, set())            # not deferred
-        self.assertEqual(imputed.get("claude-opus-9"), "opus")     # but flagged as estimated
-        self.assertEqual(total_messages(state), 1)
-        self.assertAlmostEqual(total_cost(state),
-                               one_msg_cost(*cue.TIER_PRICING["opus"]),
-                               places=9)
+    def test_unknown_model_is_banked_not_deferred(self):
+        """The inversion of the old behaviour, and the reason for the split.
 
-    def test_each_tier_uses_its_own_rate(self):
-        """A sonnet-shaped id must not be priced at the opus rate."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-sonnet-9")
+        A model this build has never heard of must be counted immediately. It
+        used to be withheld pending a PRICING entry, which meant a fleet-wide
+        image rollout raced Claude Code's ~30d transcript retention.
+        """
+        write_msg(self.d, "a.jsonl", "msg-a", model="claude-nextgen-9")
         state = cue.empty_state()
         cue.update_state(state, self.d)
-        self.assertAlmostEqual(total_cost(state),
-                               one_msg_cost(*cue.TIER_PRICING["sonnet"]),
-                               places=9)
+        self.assertEqual(models_in(state), {"claude-nextgen-9"})
+        self.assertEqual(total_messages(state), 1)
+        self.assertEqual(total_tokens(state), ONE_MSG_TOKENS)
 
-    def test_dated_snapshot_of_unknown_model_collapses_to_one_series(self):
-        """Two snapshots of the same unreleased model are one series, not two."""
-        write_msg(self.d, "a.jsonl", "m1", model="claude-haiku-9-20260901")
-        write_msg(self.d, "a.jsonl", "m2", model="claude-haiku-9-20261101")
+    def test_unknown_vendor_model_is_banked(self):
+        """Not just unseen Anthropic ids — any vendor. The server decides what
+        it can price; the client does not get a veto."""
+        write_msg(self.d, "a.jsonl", "msg-a", model="somelab/some-model-v3")
         state = cue.empty_state()
-        _, imputed, _, _ = cue.update_state(state, self.d)
-        models = {k.split("\x1f")[0] for k in state["cost"]}
-        self.assertEqual(models, {"claude-haiku-9"})
-        self.assertEqual(imputed, {"claude-haiku-9": "haiku"})
+        cue.update_state(state, self.d)
+        self.assertEqual(models_in(state), {"somelab/some-model-v3"})
+        self.assertEqual(total_tokens(state), ONE_MSG_TOKENS)
 
-    def test_pinned_model_is_not_reported_as_imputed(self):
-        """An exact PRICING hit must never be flagged as an estimate, or
-        ClaudeUsageImputedPrice would fire forever on ordinary traffic."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-4-8")
+    def test_unknown_model_is_counted_exactly_once(self):
+        """Banking an unknown model must still mark it seen, or every scrape
+        re-adds it and the counter runs away."""
+        write_msg(self.d, "a.jsonl", "msg-a", model="claude-nextgen-9")
         state = cue.empty_state()
-        unpriced, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(unpriced, set())
-        self.assertEqual(imputed, {})
+        cue.update_state(state, self.d)
+        cue.update_state(state, self.d)
+        cue.update_state(state, self.d)
+        self.assertEqual(total_messages(state), 1)
+        self.assertEqual(total_tokens(state), ONE_MSG_TOKENS)
 
-    def test_context_variant_stays_unpriced(self):
-        """A bracketed long-context id bills at a premium, so pricing it at the
-        base rate would undercount. Deferring it is the deliberate choice - the
-        usage is recoverable once a real rate is pinned."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-5[1m]")
+    def test_no_price_table_is_exposed(self):
+        """A price table anywhere in this module is the regression: it would put
+        prices back in the image and re-create the two-registry problem."""
+        for gone in ("PRICING", "TIER_PRICING", "resolve_price",
+                     "imputed_models", "CACHE_READ_MULT",
+                     "CACHE_WRITE_5M_MULT", "CACHE_WRITE_1H_MULT"):
+            self.assertFalse(hasattr(cue, gone),
+                             f"{gone} must not exist: prices live server-side")
+
+    def test_render_emits_no_cost_or_pricing_metrics(self):
+        write_msg(self.d, "a.jsonl", "msg-a")
         state = cue.empty_state()
-        unpriced, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertIn("claude-opus-5[1m]", unpriced)
-        self.assertEqual(imputed, {})
-        self.assertEqual(total_cost(state), 0)
+        cue.update_state(state, self.d)
+        text = cue.render(state, 1, 0.01, "")
+        for gone in ("claude_code_cost_usd_total",
+                     "claude_code_unpriced_model_info",
+                     "claude_code_imputed_price_model_info",
+                     "claude_code_usage_exporter_unpriced_models",
+                     "claude_code_usage_exporter_imputed_price_models"):
+            self.assertNotIn(gone, text)
 
-    def test_non_claude_model_is_still_deferred(self):
-        """The family fallback must not swallow an unrelated vendor's id."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="mistral/large-3")
+    def test_render_still_emits_the_series_the_server_prices(self):
+        """The server joins on (model, type), so every bucket must be present
+        even when zero — a missing leg silently drops that leg's cost."""
+        write_msg(self.d, "a.jsonl", "msg-a")
         state = cue.empty_state()
-        unpriced, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertIn("mistral/large-3", unpriced)
-        self.assertEqual(imputed, {})
+        cue.update_state(state, self.d)
+        text = cue.render(state, 1, 0.01, "")
+        for t in ("input", "output", "cache_read",
+                  "cache_write_5m", "cache_write_1h"):
+            self.assertIn(f'type="{t}"', text)
 
-    def test_every_tier_rate_is_grounded_in_a_pinned_price(self):
-        """A tier rate is only defensible as the rate that tier's pinned models
-        already share. An invented rate would silently misprice every future
-        release in that line."""
-        for tier, rate in cue.TIER_PRICING.items():
-            matching = []
-            for key, pinned in cue.PRICING.items():
-                m = cue._MODEL_RE.match(key)
-                if m and m.group(1) == tier:
-                    matching.append(pinned)
-            self.assertTrue(matching, f"tier {tier} has no pinned model backing it")
-            self.assertIn(rate, matching,
-                          f"tier {tier} rate {rate} matches no pinned {tier} price")
-
-    def test_fable_is_deliberately_not_imputed(self):
-        """Fable 5 is $10/$50 and breaks the tier pattern the other lines share,
-        so an unrecognised fable release must defer rather than be guessed.
-        See ansible-scripts docs/model-pricing-automation.md."""
-        self.assertNotIn("fable", cue.TIER_PRICING)
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-fable-9")
-        state = cue.empty_state()
-        unpriced, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertIn("claude-fable-9", unpriced)
-        self.assertEqual(imputed, {})
-        self.assertEqual(total_cost(state), 0)
-
-    def test_imputed_set_persists_across_runs(self):
-        """The imputed set is a STOCK, not a flow: it must stay populated for as
-        long as estimated dollars sit in the counter.
-
-        An imputed message is banked and marked seen, so deriving this from what
-        a run folded in reports the model once and zero forever after. The gauge
-        would collapse one scrape after the model appeared and the alert's for-
-        clock would reset constantly, making ClaudeUsageImputedPrice unfireable.
-        Contrast unpriced, which is safe per-run only because deferred messages
-        are deliberately never marked seen.
-        """
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-9")
-        state = cue.empty_state()
-        for run in range(3):
-            _, imputed, _, _ = cue.update_state(state, self.d)
-            self.assertEqual(imputed, {"claude-opus-9": "opus"},
-                             f"imputed set emptied on run {run + 1}")
-
-    def test_imputed_set_survives_a_restart(self):
-        """A fresh process loading the state file must still report the banked
-        dollars as estimated - otherwise a restart erases the only record that
-        any cost was imputed, and nothing can answer 'which totals are guesses'."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-9")
+    def test_state_from_a_pricing_era_build_upgrades_without_resetting(self):
+        """The rollout path. An old state file carries a "cost" key this build
+        does not know. It must be ignored, NOT rejected — rejecting it would
+        drop the seen-set and re-bank every message still on disk, double
+        counting against the counter the server has already scraped."""
+        write_msg(self.d, "a.jsonl", "msg-a")
         state = cue.empty_state()
         cue.update_state(state, self.d)
         path = os.path.join(self.d, "state.json")
         cue.save_state(path, state)
 
-        os.remove(os.path.join(self.d, "a.jsonl"))   # transcript pruned meanwhile
-        restarted = cue.load_state(path)
-        _, imputed, _, _ = cue.update_state(restarted, self.d)
-        self.assertEqual(imputed, {"claude-opus-9": "opus"})
+        with open(path) as f:
+            data = json.load(f)
+        data["cost"] = {"claude-opus-4-8\x1fcli": 1.2345}   # pricing-era key
+        with open(path, "w") as f:
+            json.dump(data, f)
 
-    def test_pinning_an_imputed_model_clears_it_without_double_counting(self):
-        """The intended lifecycle: imputed on release day, exact once someone
-        pins the published rate. Pinning - and ONLY pinning - clears the flag,
-        and the already-banked messages must not be counted a second time."""
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-9")
+        reloaded = cue.load_state(path)
+        self.assertEqual(total_tokens(reloaded), ONE_MSG_TOKENS)
+        self.assertEqual(total_messages(reloaded), 1)
+        cue.update_state(reloaded, self.d)      # same disk, already seen
+        self.assertEqual(total_messages(reloaded), 1)   # no double count
+
+    def test_previously_deferred_usage_is_recovered_on_upgrade(self):
+        """Usage an old build deferred was never marked seen, so this build
+        picks it up on first parse — as long as the transcript is still there."""
+        write_msg(self.d, "a.jsonl", "msg-a", model="claude-nextgen-9")
+        # A pricing-era state file: the message was seen on disk but withheld,
+        # so it appears in neither `seen` nor the token totals.
         state = cue.empty_state()
-        _, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(imputed, {"claude-opus-9": "opus"})
-        banked = total_cost(state)
-        self.assertAlmostEqual(banked, one_msg_cost(*cue.TIER_PRICING["opus"]),
-                               places=9)
+        path = os.path.join(self.d, "state.json")
+        cue.save_state(path, state)
 
-        cue.PRICING["claude-opus-9"] = (8.0, 40.0)   # operator pins the real rate
-        self.addCleanup(lambda: cue.PRICING.pop("claude-opus-9", None))
-        _, imputed2, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(imputed2, {})
-        self.assertEqual(total_messages(state), 1)          # not re-counted
-        self.assertAlmostEqual(total_cost(state), banked, places=9)
-        # The banked dollars keep the tier rate: monotonic counters cannot be
-        # restated, which is why the alert must be reachable in the first place.
-        self.assertNotAlmostEqual(total_cost(state), one_msg_cost(8.0, 40.0),
-                                  places=9)
+        upgraded = cue.load_state(path)
+        cue.update_state(upgraded, self.d)
+        self.assertEqual(total_tokens(upgraded), ONE_MSG_TOKENS)
 
-    def test_dot_release_is_not_folded_into_its_parent(self):
-        """claude-opus-5-1 must not collapse into claude-opus-5. It used to,
-        landing on the wrong model label at the parent's rate and reaching
-        neither alert. It should now stand as its own imputed series."""
-        self.assertEqual(cue.normalize_model("claude-opus-5-1"), "claude-opus-5-1")
-        write_msg(self.d, "a.jsonl", "msg-a", model="claude-opus-5-1")
+    def test_human_summary_reports_tokens_without_prices(self):
+        write_msg(self.d, "a.jsonl", "msg-a")
         state = cue.empty_state()
-        _, imputed, _, _ = cue.update_state(state, self.d)
-        self.assertEqual(imputed, {"claude-opus-5-1": "opus"})
-        self.assertEqual({k.split("\x1f")[0] for k in state["cost"]},
-                         {"claude-opus-5-1"})
-
-    def test_qualified_variant_is_not_priced_at_the_base_rate(self):
-        """A suffix that is not a dated snapshot must not resolve to the base
-        model - guessing a qualified variant's rate risks undercounting."""
-        for variant in ("claude-opus-5-fast", "claude-opus-5[1m]"):
-            self.assertEqual(cue.normalize_model(variant), variant)
-            self.assertEqual(cue.resolve_price(variant), (None, None))
-
-    def test_render_emits_imputed_price_series(self):
-        text = cue.render(cue.empty_state(), set(), {"claude-opus-9": "opus"},
-                          1, 0.01, "")
-        self.assertIn(
-            'claude_code_imputed_price_model_info{model="claude-opus-9",tier="opus"} 1',
-            text)
-        self.assertIn("claude_code_usage_exporter_imputed_price_models 1", text)
+        cue.update_state(state, self.d)
+        text = cue.human_summary(state)
+        self.assertIn("TOTAL tokens", text)
+        self.assertIn("claude-opus-4-8", text)
+        self.assertNotIn("$0", text)          # no fabricated dollar figures
 
 
 if __name__ == "__main__":

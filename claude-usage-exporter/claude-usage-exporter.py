@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export Claude Code token/cost usage to Prometheus textfile format.
+"""Export Claude Code token usage to Prometheus textfile format.
 
 Parses local session transcripts (~/.claude/projects/**/*.jsonl) — which record
 every assistant message's token usage for BOTH interactive and headless (`-p`)
@@ -10,10 +10,23 @@ Why transcripts instead of OpenTelemetry: Claude Code's OTLP exporter does not
 emit anything in headless/print mode (verified on v2.1.x), and ~89% of usage on
 the automation host is headless. Transcripts capture all of it, plus full history.
 
-Cost is the API-EQUIVALENT dollar value (list price), not a subscription bill —
-on a Max/Pro plan it answers "what would this have cost on the API" for the
-upgrade/value question. Cache writes are priced by actual TTL (5m vs 1h) from the
-`ephemeral_*_input_tokens` split; cache reads at 0.1x input.
+THIS EXPORTER DOES NOT PRICE ANYTHING. It reports model names and token counts;
+dollars are computed server-side by the `ai:anthropic_price_usd_per_mtok` and
+`ai:local_price_usd_per_mtok` recording rules in the ansible-scripts repo
+(docker-composes/misaka/loki/config/prometheus/ai-usage-rules.yml), which are the
+single price registry.
+
+That split is deliberate. A price table baked into this image made every new
+model release a fleet-wide image rollout: the table shipped to each host, so a
+host that missed a rebuild under-counted silently. neb ran a 3-week-old build
+through the claude-opus-5 launch for exactly that reason. Prices now change in
+one file on the monitoring host and apply to every host's history at once,
+retroactively, because cost is derived from the token counters at query time
+rather than banked at parse time.
+
+The corollary is that EVERY model's tokens must be banked unconditionally, even
+one this code has never heard of — an unknown model is the normal case now, not
+an error. Anything dropped here can never be priced later.
 
 Durable monotonic counter: the emitted metrics are Prometheus `counter`s, so they
 must never decrease. The transcript store on disk SHRINKS (sessions cleared with
@@ -42,88 +55,22 @@ import threading
 import time
 from collections import defaultdict
 
-# Base list pricing, $ per 1M tokens (input, output).
-# Every rate below verified 2026-07-26 against platform.claude.com's models
-# overview. (The claude-api skill's own table is a cache with an older stamp and
-# omits some entries here, so it is not the citable source for this table.)
-# Cache rates derived from documented multipliers: read 0.1x, write-5m 1.25x,
-# write-1h 2.0x of input. Base list pricing - note claude-sonnet-5 carries
-# introductory $2/$10 through 2026-08-31, so its imputed cost reads high until then.
-PRICING = {
-    "claude-fable-5":   (10.0, 50.0),
-    "claude-opus-5":    (5.0, 25.0),
-    "claude-opus-4-8":  (5.0, 25.0),
-    "claude-opus-4-7":  (5.0, 25.0),
-    "claude-opus-4-6":  (5.0, 25.0),
-    "claude-opus-4-5":  (5.0, 25.0),
-    "claude-sonnet-5":  (3.0, 15.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-sonnet-4-5": (3.0, 15.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-    # Self-hosted local models, keyed by official OpenRouter id and priced at
-    # OpenRouter list rates as imputed cost (openrouter.ai/api/v1/models,
-    # cached 2026-07-12). Not real spend - the dashboard can split on model.
-    "qwen/qwen3.6-35b-a3b": (0.14, 1.0),
-    "deepseek/deepseek-v4-flash": (0.077, 0.154),
-}
-
 # Legacy lane aliases served by the odin LiteLLM router, mapped to the official
 # OpenRouter model id. New local lanes should use the official id directly
 # (base model name, quantization/variant suffixes trimmed) so no alias is needed.
+#
+# This is model-NAME normalization, not pricing: it exists so one lane's usage
+# lands on one series. The server's price rules key on the resulting id, so a
+# name that arrives here un-aliased is what shows up as unpriced downstream.
 LOCAL_MODEL_ALIASES = {
     "smart": "qwen/qwen3.6-35b-a3b",
 }
 
-# Per-tier fallback rates, $ per 1M tokens (input, output). Values are the rates
-# the PRICING entries above already share within each tier, so this adds no
-# unverified price claim - it only says a new generation bills like the current
-# one. Anthropic has held that across every generation listed above (opus 4-5 ->
-# 5, sonnet 4-5 -> 5, haiku 4-5).
-#
-# Why this exists: without it a model released today is DEFERRED - held
-# uncounted, recoverable only while its transcripts survive Claude Code's
-# retention window. That is a countdown, not a cosmetic undercount, and it is
-# what left claude-opus-5 uncounted from 2026-07-25 to 2026-07-29. A tier match
-# prices it on day one; token and message counts were always exact and stay so.
-#
-# Note the evidence is not equally strong across the three: opus and sonnet each
-# have four priced generations behind them, haiku exactly one. That argues for
-# alerting on every imputed rate, not for dropping the haiku arm.
-#
-# claude-fable-* is deliberately absent. Fable 5 is $10/$50 and already breaks
-# the tier pattern the other three share, so a hypothetical claude-fable-6 falls
-# through to deferral - the conservative outcome for a line whose pricing we
-# cannot extrapolate. Unknown vendors and local models keep deferring too.
-# Rationale and phasing: ansible-scripts docs/model-pricing-automation.md.
-TIER_PRICING = {
-    "opus":   (5.0, 25.0),
-    "sonnet": (3.0, 15.0),
-    "haiku":  (1.0, 5.0),
-}
-
 # A dated snapshot suffix, e.g. the -20251001 of claude-haiku-4-5-20251001. This
-# is the ONLY suffix normalize_model strips. It used to strip any suffix under a
-# PRICING key, which silently folded a dot-release into its parent: claude-opus-5-1
-# resolved to claude-opus-5, priced exact, landed on the wrong `model` label, and
-# could reach neither alert. The Opus line ships dot-releases (4-5, 4-6, 4-7, 4-8),
-# so that was aimed squarely at the next release.
+# is the ONLY suffix normalize_model strips, so every snapshot of a release
+# aggregates into one series while a dot-release (claude-opus-5-1) stays distinct
+# from its parent - they may not share a price, and the server prices per id.
 _SNAPSHOT_RE = re.compile(r"-\d{8}$")
-
-# claude-<tier>-<version>, e.g. claude-opus-4-5, claude-sonnet-5, claude-opus-5-1.
-# The tier is captured rather than enumerated, so TIER_PRICING stays the single
-# place deciding which tiers may be imputed - an unrecognised tier shape-matches
-# here, finds no rate, and defers.
-#
-# Anchored, so anything carrying an extra qualifier - a bracketed context variant
-# like claude-opus-5[1m], a -fast suffix - fails to match and defers rather than
-# being priced at the base rate. Note this is a guard against a plausible naming,
-# not an observed one: no bracketed id appears in any transcript on this fleet
-# today, and a 1M-context session records plain claude-opus-5, so long-context
-# usage is currently priced at the base rate regardless.
-_MODEL_RE = re.compile(r"^claude-([a-z]+)-\d+(?:-\d+)*$")
-CACHE_READ_MULT = 0.1
-CACHE_WRITE_5M_MULT = 1.25
-CACHE_WRITE_1H_MULT = 2.0
 
 # Token buckets tracked per (model, entrypoint).
 TYPES = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
@@ -150,23 +97,6 @@ def normalize_model(model):
     return _SNAPSHOT_RE.sub("", model)
 
 
-def resolve_price(model):
-    """Return ((input, output), tier) for a model, or (None, None).
-
-    tier is None for an exact PRICING hit and the tier name (e.g. "opus") when
-    the rate was imputed from TIER_PRICING. Callers surface the imputed case
-    separately so an estimate is never mistaken for a verified rate.
-    """
-    if model in PRICING:
-        return PRICING[model], None
-    m = _MODEL_RE.match(model)
-    if m:
-        tier = m.group(1)
-        if tier in TIER_PRICING:
-            return TIER_PRICING[tier], tier
-    return None, None
-
-
 def _ident_hash(s):
     """Stable, compact identity for the seen-set (8-byte blake2b, 16 hex chars)."""
     return hashlib.blake2b(s.encode("utf-8", "surrogatepass"),
@@ -181,7 +111,6 @@ def empty_state():
     """A fresh, zeroed accumulator.
 
     tokens:   series-key -> {type: int}
-    cost:     series-key -> usd float
     messages: series-key -> int
     seen:     set of counted message-identity hashes (dedup across runs/restarts)
     sessions: set of session-id hashes (distinct-session count)
@@ -189,7 +118,6 @@ def empty_state():
     return {
         "version": STATE_VERSION,
         "tokens": {},
-        "cost": {},
         "messages": {},
         "seen": set(),
         "sessions": set(),
@@ -202,6 +130,12 @@ def load_state(path):
     Corrupt/unreadable state degrades to empty (with a warning) rather than
     crash-looping; the next parse re-accumulates from whatever is on disk, which
     re-baselines the counter once — better than never serving metrics.
+
+    A state file written by a pricing-era build carries an extra "cost" key; it
+    is ignored rather than rejected, so the upgrade keeps the seen-set and the
+    token counters continue unbroken instead of re-baselining. Rolling BACK to
+    such a build is the lossy direction: its loader requires "cost", so it takes
+    the corrupt path above and re-accumulates from whatever transcripts remain.
     """
     if not path or not os.path.exists(path):
         return empty_state()
@@ -211,7 +145,6 @@ def load_state(path):
         st = empty_state()
         st["tokens"] = {k: {t: int(v.get(t, 0)) for t in TYPES}
                         for k, v in data["tokens"].items()}
-        st["cost"] = {k: float(v) for k, v in data["cost"].items()}
         st["messages"] = {k: int(v) for k, v in data["messages"].items()}
         st["seen"] = set(data.get("seen", []))
         st["sessions"] = set(data.get("sessions", []))
@@ -227,7 +160,6 @@ def save_state(path, state):
     data = {
         "version": STATE_VERSION,
         "tokens": state["tokens"],
-        "cost": state["cost"],
         "messages": state["messages"],
         # list(), not sorted() — order is irrelevant on reload (rebuilt into a
         # set) and saves the O(n log n) sort under the serve lock as it grows.
@@ -261,18 +193,19 @@ def update_state(state, projects_dir):
     """Fold any not-yet-counted transcript messages into `state` (mutates it).
 
     Only NEW message identities are added — deletions never subtract, re-parses
-    never double-count — so the accumulated totals are monotonic. Returns the set
-    of unpriced models seen on disk this run (a gauge; not banked), a {model:
-    tier} map of those priced from a tier rate rather than a pinned one, the file
-    count, and whether the accumulator changed (so callers skip a no-op save).
+    never double-count — so the accumulated totals are monotonic. Returns the
+    file count and whether the accumulator changed (so callers skip a no-op save).
+
+    Every model is banked, including ids this code has never seen. Pricing is the
+    server's job, and a token dropped here is unrecoverable once the transcript
+    ages out; an unknown id costs one extra series and prices retroactively the
+    moment a rule names it.
     """
     tokens = state["tokens"]
-    cost = state["cost"]
     messages = state["messages"]
     seen = state["seen"]
     sessions = state["sessions"]
     baseline = len(seen) + len(sessions)  # to report whether anything new was folded in
-    unpriced = set()  # models resolving to no rate at all — deferred, not counted
     files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
 
     for fp in files:
@@ -310,15 +243,6 @@ def update_state(state, projects_dir):
                     sid = o.get("sessionId")
                     if sid:
                         sessions.add(_ident_hash(sid))
-                    rate, tier = resolve_price(model)
-                    if rate is None:
-                        # Defer: don't bank at $0 (which would freeze this cost
-                        # forever) and don't mark seen — once the model resolves
-                        # to a rate, a later run counts it while it's still on
-                        # disk. Only ids matching no priced tier reach here.
-                        unpriced.add(model)
-                        continue
-
                     seen.add(h)
                     entry = o.get("entrypoint") or "unknown"
 
@@ -344,49 +268,14 @@ def update_state(state, projects_dir):
                     td["cache_write_5m"] += c5m
                     td["cache_write_1h"] += c1h
                     messages[k] = messages.get(k, 0) + 1
-
-                    p_in, p_out = rate
-                    cost[k] = cost.get(k, 0.0) + (
-                        inp * p_in
-                        + cread * p_in * CACHE_READ_MULT
-                        + c5m * p_in * CACHE_WRITE_5M_MULT
-                        + c1h * p_in * CACHE_WRITE_1H_MULT
-                        + out * p_out
-                    ) / 1_000_000.0
         except OSError:
             continue
 
     dirty = (len(seen) + len(sessions)) != baseline  # only-add, so != means grew
-    return unpriced, imputed_models(state), len(files), dirty
+    return len(files), dirty
 
 
-def imputed_models(state):
-    """{model: tier} for every model in the accumulator priced at a tier rate.
-
-    Derived from the banked state, NOT from what this run happened to fold in.
-    That distinction is the whole alert: an imputed message is banked and marked
-    seen, so a per-run set would report the model once and read 0 on every
-    later scrape — the gauge would collapse a scrape after the model appeared,
-    its `for:` clock would reset constantly, and ClaudeUsageImputedPrice could
-    never fire. (unpriced is safe as a per-run set only because deferred
-    messages are deliberately never marked seen, so they re-derive every run.)
-
-    Reading it off the accumulator makes it a stock, not a flow: it stays set
-    for as long as estimated dollars sit in the counter, survives a restart via
-    the state file, and self-clears the moment PRICING gains a real rate.
-    """
-    out = {}
-    for key in state["cost"]:
-        model = key.split(_SEP, 1)[0]
-        if model in out:
-            continue
-        _, tier = resolve_price(model)
-        if tier:
-            out[model] = tier
-    return out
-
-
-def render(state, unpriced, imputed, n_files, duration, host):
+def render(state, n_files, duration, host):
     """Render Prometheus text-exposition format from the accumulated state.
 
     On hosts running alloy-remote, `host` is added by remote_write external_labels,
@@ -411,7 +300,7 @@ def render(state, unpriced, imputed, n_files, duration, host):
         for label_pairs, value in rows:
             out.append(f"{name}{labels(*label_pairs)} {value}")
 
-    tokens, cost, messages = state["tokens"], state["cost"], state["messages"]
+    tokens, messages = state["tokens"], state["messages"]
 
     tok_rows = []
     for k, d in sorted(tokens.items()):
@@ -423,14 +312,6 @@ def render(state, unpriced, imputed, n_files, duration, host):
            "Cumulative Claude Code token usage (parsed from local transcripts).",
            "counter", tok_rows)
 
-    cost_rows = []
-    for k, c in sorted(cost.items()):
-        model, entry = k.split(_SEP, 1)
-        cost_rows.append(((lp("model", model), lp("entrypoint", entry)), f"{c:.6f}"))
-    family("claude_code_cost_usd_total",
-           "Cumulative API-equivalent cost in USD (list price; not a subscription bill).",
-           "counter", cost_rows)
-
     msg_rows = []
     for k, m in sorted(messages.items()):
         model, entry = k.split(_SEP, 1)
@@ -438,27 +319,14 @@ def render(state, unpriced, imputed, n_files, duration, host):
     family("claude_code_messages_total",
            "Cumulative assistant message count.", "counter", msg_rows)
 
-    # Info series (value 1) naming each model seen on disk but missing from
-    # PRICING — its usage is deferred (uncounted) until priced. Normally emits no
-    # series; when one appears, alerting fires on the scalar gauge below and reads
-    # the model name here.
-    family("claude_code_unpriced_model_info",
-           "Models with no rate, neither pinned nor imputable from a tier (value 1; usage deferred until priced).",
-           "gauge", (((lp("model", model),), 1) for model in sorted(unpriced)))
-
-    # Info series (value 1) naming each model counted at its tier's rate rather
-    # than a pinned one — usage IS counted, but the dollar figure is an estimate.
-    # Pinning the published rate in PRICING clears it.
-    family("claude_code_imputed_price_model_info",
-           "Models priced from their tier's rate rather than a pinned one (value 1; cost is imputed).",
-           "gauge", (((lp("model", model), lp("tier", tier)), 1)
-                     for model, tier in sorted(imputed.items())))
+    # No unpriced/imputed gauges: this build holds no prices, so it cannot know
+    # whether a model is priced. The equivalent signal is server-side —
+    # AiUsageUnpricedModel fires on tokens arriving with no matching price rule,
+    # which covers every lane at once rather than only what a client could see.
 
     ts = int(time.time())
     for name, helptext, mtype, value in (
         ("claude_code_sessions_total", "Distinct Claude Code session count.", "counter", len(state["sessions"])),
-        ("claude_code_usage_exporter_unpriced_models", "Count of distinct models with no rate, neither pinned nor imputable from a tier (usage deferred).", "gauge", len(unpriced)),
-        ("claude_code_usage_exporter_imputed_price_models", "Count of distinct models counted at their tier's rate rather than a pinned one (cost imputed).", "gauge", len(imputed)),
         ("claude_code_usage_exporter_transcripts", "Transcript files parsed in the last run.", "gauge", n_files),
         ("claude_code_usage_exporter_last_run_timestamp_seconds", "Unix time of the last exporter run.", "gauge", ts),
         ("claude_code_usage_exporter_duration_seconds", "Wall-clock seconds of the last exporter run.", "gauge", round(duration, 3)),
@@ -469,26 +337,36 @@ def render(state, unpriced, imputed, n_files, duration, host):
 
 
 def human_summary(state):
-    by_model_cost = defaultdict(float)
-    by_entry_cost = defaultdict(float)
+    """Token breakdown for --print.
+
+    Reports tokens, not dollars: this build carries no price table, and inventing
+    one here purely for the terminal would recreate the second registry the split
+    exists to remove. Dollars live on the AI Usage dashboard, which prices the
+    same counters server-side.
+    """
+    by_model = defaultdict(int)
+    by_entry = defaultdict(int)
     grand_tokens = defaultdict(int)
-    for k, c in state["cost"].items():
-        model, entry = k.split(_SEP, 1)
-        by_model_cost[model] += c
-        by_entry_cost[entry] += c
     for k, d in state["tokens"].items():
+        model, entry = k.split(_SEP, 1)
+        n = sum(d.get(t, 0) for t in TYPES)
+        by_model[model] += n
+        by_entry[entry] += n
         for t in TYPES:
             grand_tokens[t] += d.get(t, 0)
     lines = [f"sessions: {len(state['sessions'])}   messages: {sum(state['messages'].values())}", ""]
-    lines.append("API-equivalent $ by model:")
-    for m, c in sorted(by_model_cost.items(), key=lambda x: -x[1]):
-        lines.append(f"  {m:<26} ${c:,.2f}")
-    lines.append("\nAPI-equivalent $ by entrypoint:")
-    for e, c in sorted(by_entry_cost.items(), key=lambda x: -x[1]):
-        lines.append(f"  {e:<26} ${c:,.2f}")
-    lines.append(f"\nTOTAL API-equivalent value: ${sum(by_model_cost.values()):,.2f}")
+    lines.append("tokens by model:")
+    for m, n in sorted(by_model.items(), key=lambda x: -x[1]):
+        lines.append(f"  {m:<26} {n:>15,}")
+    lines.append("\ntokens by entrypoint:")
+    for e, n in sorted(by_entry.items(), key=lambda x: -x[1]):
+        lines.append(f"  {e:<26} {n:>15,}")
     gt = sum(grand_tokens.values())
-    lines.append(f"gross tokens: {gt:,}   output: {grand_tokens['output']:,}   cache_read: {grand_tokens['cache_read']:,}")
+    lines.append(f"\nTOTAL tokens: {gt:,}")
+    lines.append(f"input: {grand_tokens['input']:,}   output: {grand_tokens['output']:,}   "
+                 f"cache_read: {grand_tokens['cache_read']:,}   "
+                 f"cache_write: {grand_tokens['cache_write_5m'] + grand_tokens['cache_write_1h']:,}")
+    lines.append("\n$ figures: see the AI Usage dashboard (prices live server-side).")
     return "\n".join(lines)
 
 
@@ -508,17 +386,10 @@ def serve(args):
 
     def regen():
         start = time.time()
-        unpriced, imputed, n_files, dirty = update_state(state, args.projects_dir)
-        if unpriced:
-            print(f"warning: model(s) absent from pricing table, usage deferred: "
-                  f"{', '.join(sorted(unpriced))}", file=sys.stderr)
-        if imputed:
-            print(f"note: model(s) priced at their tier rate, cost is imputed: "
-                  f"{', '.join(sorted(imputed))}", file=sys.stderr)
+        n_files, dirty = update_state(state, args.projects_dir)
         if args.state_file and dirty:
             persist_state(args.state_file, state)
-        rendered["text"] = render(state, unpriced, imputed, n_files,
-                                  time.time() - start, args.host)
+        rendered["text"] = render(state, n_files, time.time() - start, args.host)
         rendered["ts"] = time.monotonic()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -572,17 +443,8 @@ def main():
 
     state = load_state(args.state_file)
     start = time.time()
-    unpriced, imputed, n_files, dirty = update_state(state, args.projects_dir)
+    n_files, dirty = update_state(state, args.projects_dir)
     duration = time.time() - start
-
-    if unpriced:
-        print(f"warning: {len(unpriced)} model(s) absent from pricing table, usage deferred: "
-              f"{', '.join(sorted(unpriced))} — add them to PRICING.", file=sys.stderr)
-
-    if imputed:
-        print(f"note: {len(imputed)} model(s) priced at their tier rate, cost is imputed: "
-              f"{', '.join(sorted(imputed))} — pin the published rate in PRICING.",
-              file=sys.stderr)
 
     if args.do_print:
         # Read-only view: reflect the latest disk, but never persist from --print
@@ -600,7 +462,7 @@ def main():
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    text = render(state, unpriced, imputed, n_files, duration, args.host)
+    text = render(state, n_files, duration, args.host)
     tmp = f"{args.output}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         f.write(text)
